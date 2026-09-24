@@ -28,6 +28,7 @@ class GNAR:
         coeffs (np.ndarray or pd.DataFrame): The parameters of the GNAR model, consisting of the mean and coefficients of each node. Shape (1 + p + sum(s), d).
         mean (float, int, np.ndarray or pd.DataFrame): The mean of the time series data. If a float, the same mean is used for all nodes. Only required if parameters is provided. Defaults to 0.
         sigma_2 (float, int, np.ndarray or pd.DataFrame): The variance or covariance of the noise. If a float, the noise is assumed to have the same variance and be independent across nodes. Only required if parameters is provided. Defaults to 1.
+        kappa (float or None): Degree normalisation exponent. The stage 1 neighbour sum of node i is scaled by N_i^(-kappa), where N_i is its number of neighbours. Defaults to 1, the standard GNAR neighbour average. Values other than 1 require a GNAR(1, [1]) standard (or global, with kappa fixed) model on an unweighted, undirected graph.
 
     Methods:
         fit: Fit the GNAR model to time series data.
@@ -52,17 +53,24 @@ class GNAR:
         coeffs: np.ndarray | pd.DataFrame | None = None,
         mean: float | int | np.ndarray | pd.DataFrame = 0,
         sigma_2: float | int | np.ndarray | pd.DataFrame = 1,
+        kappa: float | None = 1.0,
     ) -> None:
         # Initial checks
-        gnar_checks(A, p, s, model_type, net_type)
+        gnar_checks(A, p, s, model_type, net_type, kappa)
+        if kappa is None:
+            # Estimating kappa by profile likelihood is not available yet
+            raise NotImplementedError("Estimating kappa (kappa=None) is not implemented yet.")
 
         self._A = A
         self._p = p
         self._s = s
         self._model_type = model_type
         self._net_type = net_type
+        # The requested kappa (None if estimated) and the value currently used in the neighbour set matrices
+        self._kappa_spec = check_kappa(kappa)
+        self.kappa = 1.0 if self._kappa_spec is None else self._kappa_spec
         # Compute the neighbour set matrices up to the maximum stage of neighbour dependence
-        self._ns_mats = neighbour_set_mats(A, np.max(s), net_type)
+        self._ns_mats = neighbour_set_mats(A, np.max(s), net_type, self.kappa)
 
         if ts is not None:
             # If a time series is provided, fit the model to the data, removing the mean if necessary
@@ -287,12 +295,17 @@ class GNAR:
         return det + 2 * k / (self._n - self._p)
 
     def _num_params(self) -> int:
-        # Compute the number of parameters in the model
+        # Compute the number of parameters in the model, counting kappa if it is estimated
+        k_kappa = int(self._kappa_spec is None)
         if self._model_type == "global":
-            return self._p + np.sum(self._s)
+            return self._p + np.sum(self._s) + k_kappa
         elif self._model_type == "standard":
-            return self._d * self._p + np.sum(self._s)
+            return self._d * self._p + np.sum(self._s) + k_kappa
         return self._d * (self._p + np.sum(self._s))
+
+    def _show_kappa(self) -> bool:
+        # kappa is only displayed when it differs from the standard GNAR normalisation or was estimated
+        return self._kappa_spec is None or self.kappa != 1.0
 
     def to_var(self) -> VAR:
         """
@@ -329,7 +342,8 @@ class GNAR:
 
     def __repr__(self) -> str:
         fitted = self._ts is not None
-        return f"GNAR(model_type=\"{self._model_type}\", net_type=\"{self._net_type}\", p={self._p}, s={self._s.tolist()}, d={self._d}, fitted={fitted})"
+        kappa = f", kappa={self.kappa:g}" if self._show_kappa() else ""
+        return f"GNAR(model_type=\"{self._model_type}\", net_type=\"{self._net_type}\", p={self._p}, s={self._s.tolist()}, d={self._d}{kappa}, fitted={fitted})"
 
     def __str__(self) -> str:
         """
@@ -343,6 +357,9 @@ class GNAR:
             index += [f"b_{i},{j}" for j in range(1, self._s[i - 1] + 1)]
         parameters = pd.DataFrame(np.vstack([self.mu, self.coeffs]), columns=self._names, index=index)
         parameter_info = f"Parameters:\n{parameters}\n"
+        if self._show_kappa():
+            status = "estimated" if self._kappa_spec is None else "fixed"
+            parameter_info += f"kappa: {self.kappa:g} ({status})\n"
         cov = pd.DataFrame(cov_mat(self.sigma_2, self._d), index=self._names, columns=self._names)
         noise = f"Noise covariance matrix:\n{cov}\n"
         return model_info + graph_info + parameter_info + noise
