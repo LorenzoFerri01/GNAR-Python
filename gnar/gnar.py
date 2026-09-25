@@ -4,13 +4,15 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
-from gnar.utils.gnar_linear_regression import gnar_lr
+from gnar.utils.gnar_linear_regression import gnar_lr, format_X_y
 from gnar.utils.gnar_yule_walker import gnar_yw, estimate_covariance_mats, estimate_res_mat
 from gnar.utils.forecasting import format_X, update_X
 from gnar.utils.simulating import shift_X, generate_noise
 from gnar.utils.neighbour_sets import *
 from gnar.utils.data_utils import *
 from gnar.var import VAR
+from gnar.gnar_kappa import fit_gnar1
+from gnar.utils.gnar_profile_likelihood import fixed_kappa_ols
 
 class GNAR:
     """
@@ -28,7 +30,8 @@ class GNAR:
         coeffs (np.ndarray or pd.DataFrame): The parameters of the GNAR model, consisting of the mean and coefficients of each node. Shape (1 + p + sum(s), d).
         mean (float, int, np.ndarray or pd.DataFrame): The mean of the time series data. If a float, the same mean is used for all nodes. Only required if parameters is provided. Defaults to 0.
         sigma_2 (float, int, np.ndarray or pd.DataFrame): The variance or covariance of the noise. If a float, the noise is assumed to have the same variance and be independent across nodes. Only required if parameters is provided. Defaults to 1.
-        kappa (float or None): Degree normalisation exponent. The stage 1 neighbour sum of node i is scaled by N_i^(-kappa), where N_i is its number of neighbours. Defaults to 1, the standard GNAR neighbour average. Values other than 1 require a GNAR(1, [1]) standard (or global, with kappa fixed) model on an unweighted, undirected graph.
+        kappa (float or None): Degree normalisation exponent. The stage 1 neighbour sum of node i is scaled by N_i^(-kappa), where N_i is its number of neighbours. Defaults to 1, the standard GNAR neighbour average. Values other than 1 require a GNAR(1, [1]) standard (or global, with kappa fixed) model on an unweighted, undirected graph. None estimates kappa by profile likelihood when fitting (standard model, method "OLS"); the full fit, with standard errors, is stored in the kappa_fit attribute.
+        kappa_bounds (tuple): Bounds of the search for kappa when kappa is None. Defaults to (0, 1.5).
 
     Methods:
         fit: Fit the GNAR model to time series data.
@@ -54,12 +57,12 @@ class GNAR:
         mean: float | int | np.ndarray | pd.DataFrame = 0,
         sigma_2: float | int | np.ndarray | pd.DataFrame = 1,
         kappa: float | None = 1.0,
+        kappa_bounds: tuple[float, float] = (0.0, 1.5),
     ) -> None:
         # Initial checks
         gnar_checks(A, p, s, model_type, net_type, kappa)
-        if kappa is None:
-            # Estimating kappa by profile likelihood is not available yet
-            raise NotImplementedError("Estimating kappa (kappa=None) is not implemented yet.")
+        if kappa is None and ts is None:
+            raise ValueError("kappa=None (estimate kappa) requires time series data (ts).")
 
         self._A = A
         self._p = p
@@ -69,6 +72,7 @@ class GNAR:
         # The requested kappa (None if estimated) and the value currently used in the neighbour set matrices
         self._kappa_spec = check_kappa(kappa)
         self.kappa = 1.0 if self._kappa_spec is None else self._kappa_spec
+        self._kappa_bounds = kappa_bounds
         # Compute the neighbour set matrices up to the maximum stage of neighbour dependence
         self._ns_mats = neighbour_set_mats(A, np.max(s), net_type, self.kappa)
 
@@ -127,6 +131,13 @@ class GNAR:
         else:
             self.mu = np.zeros((1, self._d))
 
+        if self._kappa_spec is None:
+            # Estimate kappa by profile likelihood; the neighbour set matrices are rebuilt at the estimate on every fit
+            if method != "OLS":
+                raise NotImplementedError("Estimating kappa (kappa=None) is only implemented for method='OLS'.")
+            self._fit_kappa(ts)
+            return
+
         # Compute the neighbour sums up to the maximum stage of neighbour dependence. This is an array of shape (n, d, 1 + r), where r = max(s)
         data = compute_neighbour_sums(ts, self._ns_mats, np.max(self._s))
 
@@ -145,6 +156,22 @@ class GNAR:
             self.sigma_2 = estimate_res_mat(data, coeffs, self._p, self._s, self._n)
         else:
             raise ValueError("Method must be one of 'OLS' or 'YW'.")
+
+    def _fit_kappa(self, ts: np.ndarray) -> None:
+        # Fit the kappa-normalised GNAR(1, [1]) standard model to the (already demeaned) data, estimating kappa
+        fit = fit_gnar1(self._A, ts, kappa=None, kappa_bounds=self._kappa_bounds, demean=False)
+        fit.mu = self.mu
+        fit.names = self._names
+        self.kappa_fit = fit
+        # If kappa is not identified the fitted values do not depend on it, and kappa = 1 is used for the weights
+        self.kappa = fit.kappa if np.isfinite(fit.kappa) else 1.0
+        self._ns_mats = neighbour_set_mats(self._A, 1, self._net_type, self.kappa)
+        alpha, beta, _ = fixed_kappa_ols(fit._M, fit.degrees, self.kappa, fit._R)
+        self.coeffs = np.vstack([alpha, np.full(self._d, beta)])
+        # Residual covariance computed as in gnar_lr (divisor n - 2 for p = 1), so bic and aic work as for other models
+        X, y = format_X_y(compute_neighbour_sums(ts, self._ns_mats, 1), 1, self._s)
+        res = np.sum(X * self.coeffs.T, axis=2) - y
+        self.sigma_2 = res.T @ res / (X.shape[0] - 1)
 
     def predict(self, ts: np.ndarray | pd.DataFrame | None = None, h: int = 1) -> np.ndarray | pd.DataFrame:
         """
