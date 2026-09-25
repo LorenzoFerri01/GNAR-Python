@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.linalg import solve_discrete_lyapunov, cholesky
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import eigsh
 
@@ -8,6 +7,11 @@ from gnar.utils.neighbour_sets import node_degrees, degree_terms
 
 # Above this number of nodes the spectral radius is computed with a sparse eigensolver
 _DENSE_EIG_MAX = 2000
+# Above this number of nodes (and for sparse enough graphs) the simulator multiplies by a sparse transition matrix
+_DENSE_SIM_MAX = 400
+# Models whose spectral radius is within this distance of 1 are treated as non-stationary: their stationary covariance
+# is numerically singular
+STATIONARITY_TOL = 1e-10
 
 def shift_X(X: np.ndarray, sim: np.ndarray, ns: np.ndarray, p: int, s: np.ndarray) -> np.ndarray:
     """
@@ -62,9 +66,30 @@ def _gnar1_setup(A, alpha: float | np.ndarray, beta: float, kappa: float) -> tup
     A = check_kappa_graph(A)
     kappa = check_kappa(kappa, allow_none=False)
     d = A.shape[0]
-    alpha = np.broadcast_to(np.asarray(alpha, dtype=float), (d,)).copy()
+    try:
+        alpha = np.broadcast_to(np.asarray(alpha, dtype=float), (d,)).copy()
+    except ValueError:
+        raise ValueError(f"alpha must be a scalar or an array of length d = {d}.") from None
     beta = float(beta)
+    if not (np.all(np.isfinite(alpha)) and np.isfinite(beta)):
+        raise ValueError("alpha and beta must be finite.")
     return A, alpha, beta, kappa, node_degrees(A)
+
+def _check_sigma_2(sigma_2) -> float:
+    # The noise variance must be a positive, finite number
+    try:
+        sigma_2 = float(sigma_2)
+    except (TypeError, ValueError):
+        raise ValueError("sigma_2 must be a positive number.") from None
+    if not (np.isfinite(sigma_2) and sigma_2 > 0):
+        raise ValueError("sigma_2 must be a positive, finite number.")
+    return sigma_2
+
+def _symmetrised(A: csr_matrix, alpha: np.ndarray, beta: float, kappa: float, degrees: np.ndarray):
+    # Phi = D^(-kappa/2) S D^(kappa/2) with S = diag(alpha) + beta D^(-kappa/2) A D^(-kappa/2) symmetric (A symmetric),
+    # D = diag(N_i) and N_i := 1 for isolated nodes, whose rows and columns of A are zero. Returns S and D^(-kappa/2)
+    _, _, w_half = degree_terms(np.where(degrees > 0, degrees, 1.0), kappa / 2)
+    return diags(alpha) + beta * (diags(w_half) @ A @ diags(w_half)), w_half
 
 def gnar1_transition(A, alpha: float | np.ndarray, beta: float, kappa: float) -> csr_matrix:
     """
@@ -129,16 +154,19 @@ def spectral_radius(A, alpha: float | np.ndarray, beta: float, kappa: float) -> 
         float. Spectral radius of Phi.
     """
     A, alpha, beta, kappa, degrees = _gnar1_setup(A, alpha, beta, kappa)
-    _, _, w_half = degree_terms(degrees, kappa / 2)
-    Phi_sym = diags(alpha) + beta * (diags(w_half) @ A @ diags(w_half))
+    if beta == 0 or A.nnz == 0:
+        # Phi is diagonal
+        return float(np.max(np.abs(alpha)))
+    Phi_sym, _ = _symmetrised(A, alpha, beta, kappa, degrees)
     d = A.shape[0]
     if d <= _DENSE_EIG_MAX:
         eigs = np.linalg.eigvalsh(Phi_sym.toarray())
         return float(np.max(np.abs(eigs)))
     # Largest-magnitude eigenvalue by Lanczos. The fixed, generic starting vector keeps the result deterministic; a
-    # structured one such as a vector of ones is an eigenvector of regular graphs and would hide the rest of the spectrum
+    # structured one such as a vector of ones is an eigenvector of regular graphs and would hide the rest of the spectrum.
+    # A relative tolerance of 1e-8 is ample to decide stationarity and keeps long chains (clustered spectra) fast
     v0 = np.random.default_rng(0).standard_normal(d)
-    largest = eigsh(Phi_sym, k=1, which="LM", v0=v0, ncv=min(d - 1, 50), tol=1e-10, return_eigenvectors=False)
+    largest = eigsh(Phi_sym, k=1, which="LM", v0=v0, ncv=min(d - 1, 50), tol=1e-8, return_eigenvectors=False)
     return float(abs(largest[0]))
 
 def stationary_cov(A, alpha: float | np.ndarray, beta: float, kappa: float, sigma_2: float = 1.0) -> np.ndarray:
@@ -147,6 +175,14 @@ def stationary_cov(A, alpha: float | np.ndarray, beta: float, kappa: float, sigm
     Lyapunov equation
 
         Gamma0 = Phi Gamma0 Phi^T + sigma^2 I_d.
+
+    It is computed from the eigendecomposition of the symmetric matrix S = D^(kappa/2) Phi D^(-kappa/2) = Q diag(lambda) Q^T
+    (see spectral_radius): with P = D^(-kappa/2) Q and C = Q^T D^kappa Q,
+
+        Gamma0 = sigma^2 P [C_jk / (1 - lambda_j lambda_k)] P^T,
+
+    the closed-form sum of sigma^2 Phi^k (Phi^k)^T. Unlike the bilinear Lyapunov solver, this stays accurate when Phi has
+    an eigenvalue close to -1.
 
     Params:
         A: np.array or scipy.sparse matrix. Binary, symmetric adjacency matrix with no self-loops. Shape (d, d)
@@ -158,20 +194,25 @@ def stationary_cov(A, alpha: float | np.ndarray, beta: float, kappa: float, sigm
     Returns:
         Gamma0: np.array. Shape (d, d)
     """
+    sigma_2 = _check_sigma_2(sigma_2)
     _check_stationary(A, alpha, beta, kappa)
-    Phi = gnar1_transition(A, alpha, beta, kappa).toarray()
-    d = Phi.shape[0]
-    Gamma0 = solve_discrete_lyapunov(Phi, float(sigma_2) * np.eye(d))
+    A, alpha, beta, kappa, degrees = _gnar1_setup(A, alpha, beta, kappa)
+    S, w_half = _symmetrised(A, alpha, beta, kappa, degrees)
+    lam, Q = np.linalg.eigh(S.toarray())
+    P = w_half[:, None] * Q
+    C = (Q / (w_half * w_half)[:, None]).T @ Q
+    Gamma0 = sigma_2 * P @ (C / (1.0 - np.outer(lam, lam))) @ P.T
     return (Gamma0 + Gamma0.T) / 2
 
 def _check_stationary(A, alpha: float | np.ndarray, beta: float, kappa: float) -> None:
-    # Raise an error if the spectral radius of Phi is at least 1, reporting both the spectral radius and rho. Since the
-    # spectral radius is at most rho = ||Phi||_inf, rho < 1 settles stationarity without an eigenvalue computation
+    # Raise an error if the spectral radius of Phi is at least 1 (within STATIONARITY_TOL), reporting both the spectral
+    # radius and rho. Since the spectral radius is at most rho = ||Phi||_inf, rho < 1 settles stationarity without an
+    # eigenvalue computation
     rho = row_sum_bound(A, alpha, beta, kappa)
-    if rho < 1:
+    if rho < 1 - STATIONARITY_TOL:
         return
     radius = spectral_radius(A, alpha, beta, kappa)
-    if radius >= 1:
+    if radius >= 1 - STATIONARITY_TOL:
         raise ValueError(f"The GNAR model is not stationary: the spectral radius of Phi is {radius:.6g} >= 1 (row-sum bound rho = {rho:.6g}).")
 
 def _random_state(rng):
@@ -217,7 +258,9 @@ def simulate_gnar1(
             independent stream.
 
     Raises:
-        ValueError: if the spectral radius of Phi is at least 1 (the message reports it and the row-sum bound rho).
+        ValueError: if the spectral radius of Phi is at least 1 - 1e-10 (the message reports it and the row-sum bound
+            rho), or if an input is invalid (e.g. a directed graph, non-finite parameters, sigma_2 <= 0).
+        NotImplementedError: if A is weighted.
 
     Returns:
         X: np.array. Simulated time series, time x nodes, with X[0] the starting value. Shape (n, d)
@@ -226,19 +269,19 @@ def simulate_gnar1(
         raise ValueError("n must be at least 1 and burn_in must be non-negative.")
     if start not in {"stationary", "zero"}:
         raise ValueError("start must be 'stationary' or 'zero'.")
-    if sigma_2 <= 0:
-        raise ValueError("sigma_2 must be positive.")
+    sigma_2 = _check_sigma_2(sigma_2)
     _check_stationary(A, alpha, beta, kappa)
     Phi = gnar1_transition(A, alpha, beta, kappa)
     d = Phi.shape[0]
-    # Dense matrix-vector products are faster for small graphs; keep Phi sparse for large ones
-    Phi_T = Phi.T.toarray() if d <= _DENSE_EIG_MAX else Phi.T.tocsr()
+    # Dense matrix-vector products are faster for small or dense graphs; keep Phi sparse for large, sparse ones
+    use_sparse = d > _DENSE_SIM_MAX and Phi.nnz < 0.25 * d * d
+    Phi_T = Phi.T.tocsr() if use_sparse else Phi.T.toarray()
     gen = _random_state(rng)
     total = burn_in + n
     X = np.zeros((total, d))
     if start == "stationary":
         Gamma0 = stationary_cov(A, alpha, beta, kappa, sigma_2)
-        L = cholesky(Gamma0, lower=True)
+        L = np.linalg.cholesky(Gamma0)
         X[0] = L @ gen.standard_normal(d)
     u = np.sqrt(sigma_2) * gen.standard_normal((total - 1, d))
     for t in range(1, total):
@@ -269,6 +312,9 @@ def stationary_params(A, kappa: float, b: float, alpha: float | np.ndarray) -> f
     mask, log_N, _ = degree_terms(degrees, kappa)
     if not np.any(mask):
         raise ValueError("The graph has no edges, so the network coefficient is undefined.")
-    if np.max(np.abs(alpha)) + abs(b) >= 1:
+    b = float(b)
+    if not np.isfinite(b):
+        raise ValueError("b must be finite.")
+    if not np.max(np.abs(alpha)) + abs(b) < 1:
         raise ValueError(f"max |alpha_i| + |b| = {np.max(np.abs(alpha)) + abs(b):.6g} must be below 1 for rho < 1.")
     return float(b / np.max(np.exp((1 - kappa) * log_N[mask])))

@@ -40,6 +40,10 @@ class GNAR:
         to_networkx: Convert the adjacency matrix to a NetworkX graph.
         draw: Draw the graph using NetworkX.
     """
+    # Defaults for objects created before kappa existed (e.g. unpickled from an older version): the standard normalisation
+    _kappa = 1.0
+    _kappa_spec = 1.0
+
     def __init__(
         self,
         A: np.ndarray,
@@ -68,9 +72,9 @@ class GNAR:
         self._net_type = net_type
         # The requested kappa (None if estimated) and the value currently used in the neighbour set matrices
         self._kappa_spec = check_kappa(kappa)
-        self.kappa = 1.0 if self._kappa_spec is None else self._kappa_spec
+        self._kappa = 1.0 if self._kappa_spec is None else self._kappa_spec
         # Compute the neighbour set matrices up to the maximum stage of neighbour dependence
-        self._ns_mats = neighbour_set_mats(A, np.max(s), net_type, self.kappa)
+        self._ns_mats = neighbour_set_mats(A, np.max(s), net_type, self._kappa)
 
         if ts is not None:
             # If a time series is provided, fit the model to the data, removing the mean if necessary
@@ -303,9 +307,19 @@ class GNAR:
             return self._d * self._p + np.sum(self._s) + k_kappa
         return self._d * (self._p + np.sum(self._s))
 
+    @property
+    def kappa(self) -> float:
+        """The degree normalisation exponent used by the model (read-only; it is fixed by the neighbour set matrices)."""
+        return self._kappa
+
     def _show_kappa(self) -> bool:
         # kappa is only displayed when it differs from the standard GNAR normalisation or was estimated
-        return self._kappa_spec is None or self.kappa != 1.0
+        return self._kappa_spec is None or self._kappa != 1.0
+
+    def _kappa_text(self) -> str:
+        # Short display of kappa that never rounds a value other than 1 to "1"
+        text = f"{self._kappa:g}"
+        return repr(self._kappa) if text == "1" and self._kappa != 1.0 else text
 
     def to_var(self) -> VAR:
         """
@@ -342,7 +356,7 @@ class GNAR:
 
     def __repr__(self) -> str:
         fitted = self._ts is not None
-        kappa = f", kappa={self.kappa:g}" if self._show_kappa() else ""
+        kappa = f", kappa={self._kappa_text()}" if self._show_kappa() else ""
         return f"GNAR(model_type=\"{self._model_type}\", net_type=\"{self._net_type}\", p={self._p}, s={self._s.tolist()}, d={self._d}{kappa}, fitted={fitted})"
 
     def __str__(self) -> str:
@@ -359,7 +373,7 @@ class GNAR:
         parameter_info = f"Parameters:\n{parameters}\n"
         if self._show_kappa():
             status = "estimated" if self._kappa_spec is None else "fixed"
-            parameter_info += f"kappa: {self.kappa:g} ({status})\n"
+            parameter_info += f"kappa: {self._kappa_text()} ({status})\n"
         cov = pd.DataFrame(cov_mat(self.sigma_2, self._d), index=self._names, columns=self._names)
         noise = f"Noise covariance matrix:\n{cov}\n"
         return model_info + graph_info + parameter_info + noise

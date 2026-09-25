@@ -26,14 +26,15 @@ def check_kappa_graph(A) -> csr_matrix:
     with no self-loops (an unweighted, undirected graph). Accepts NumPy arrays and SciPy sparse matrices.
 
     Raises:
-        NotImplementedError: if A has weights other than 0 and 1 (weighted networks are not supported for kappa != 1).
-        ValueError: if A is not square, has negative entries, is not symmetric or has self-loops.
+        NotImplementedError: if A has weights other than 0 and 1 (weighted networks are not supported by the
+            kappa-normalised model).
+        ValueError: if A is not square, has negative or non-finite entries, is not symmetric or has self-loops.
 
     Returns:
-        A as a SciPy CSR matrix of floats.
+        A as a new SciPy CSR matrix of floats (the input is never modified).
     """
     if issparse(A):
-        A = csr_matrix(A, dtype=float)
+        A = csr_matrix(A, dtype=float, copy=True)
     elif isinstance(A, np.ndarray):
         if A.ndim != 2:
             raise ValueError("Adjacency matrix A must be a square matrix.")
@@ -43,14 +44,16 @@ def check_kappa_graph(A) -> csr_matrix:
     if A.shape[0] != A.shape[1]:
         raise ValueError("Adjacency matrix A must be a square matrix.")
     A.eliminate_zeros()
+    if not np.all(np.isfinite(A.data)):
+        raise ValueError("Adjacency matrix A must have finite entries.")
     if np.any(A.data < 0):
         raise ValueError("Adjacency matrix A must have non-negative weights.")
     if np.any(A.data != 1):
-        raise NotImplementedError("Weighted networks are not supported for kappa != 1; A must be binary (0 or 1).")
+        raise NotImplementedError("Weighted networks are not supported by the kappa-normalised GNAR model; A must be binary (0 or 1).")
     if np.any(A.diagonal() != 0):
-        raise ValueError("Adjacency matrix A must not contain self-loops for kappa != 1.")
+        raise ValueError("The kappa-normalised GNAR model requires a graph without self-loops (zero diagonal in A).")
     if (A != A.T).nnz != 0:
-        raise ValueError("Adjacency matrix A must be symmetric (an undirected graph) for kappa != 1.")
+        raise ValueError("The kappa-normalised GNAR model requires an undirected graph (A must be symmetric).")
     return A
 
 def gnar_checks(A: np.ndarray, p: int, s: np.ndarray, model_type: str, net_type: str = "unweighted", kappa: float | None = 1.0) -> None:

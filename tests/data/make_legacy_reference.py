@@ -9,9 +9,15 @@ Run it against the unmodified package (commit 8466a80), for example from a git w
 For every case it stores the inputs, the specification and the outputs: coefficients, noise covariance, mean,
 forecasts, a seeded simulation, the VAR form, autocovariances, BIC/AIC and the printed representations, or the type
 of the exception raised when the legacy code fails on a configuration. The inputs
-are stored as well, so the test does not depend on how they were generated. Graphs are kept small (at most 5 nodes)
-so that the iterative least-squares solver used by the standard model converges to machine precision.
+are stored as well, so the test does not depend on how they were generated.
+
+The standard model is fitted with SciPy's iterative lsqr at its default tolerances. On the GNAR(1, [1]) cases it
+converges to machine precision, but on most p = 2 cases it stops early (relative error up to about 4e-4), so those
+frozen values depend on lsqr's defaults (atol = btol = 1e-6 since SciPy 1.8, 1e-8 before). The file therefore records
+lsqr's defaults and, for each standard OLS case, the relative gap between the fitted and the exact least-squares
+coefficients ("lsqr_gap"), so the test can tell when an exact comparison is meaningful.
 """
+import inspect
 import hashlib
 import json
 import sys
@@ -20,6 +26,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import scipy
+from scipy.sparse.linalg import lsqr
 
 import gnar
 from gnar import GNAR
@@ -42,6 +49,26 @@ TS_3NODE = np.array([[0.5, -0.2, 0.3], [-0.1, 0.4, 0.2], [0.3, -0.3, 0.1], [0.2,
                      [0.1, -0.1, 0.4], [0.3, 0.2, -0.3], [-0.2, 0.3, 0.1], [0.4, -0.4, 0.2], [0.1, 0.1, -0.1],
                      [-0.3, 0.4, 0.3], [0.2, -0.2, 0.1], [0.3, 0.1, -0.4], [-0.1, 0.3, 0.2], [0.4, -0.1, 0.1],
                      [0.2, 0.2, -0.2], [-0.3, 0.4, 0.3], [0.1, -0.3, 0.2], [0.3, 0.1, -0.1], [-0.2, 0.2, 0.4]])
+
+
+def lsqr_gap(G: GNAR, ts: np.ndarray, demean: bool) -> float:
+    """Relative gap between the lsqr coefficients of a fitted standard model and the exact least-squares solution."""
+    from gnar.utils.gnar_linear_regression import format_X_y
+    from gnar.utils.neighbour_sets import compute_neighbour_sums
+    x = ts - ts.mean(axis=0) if demean else ts
+    p, s = G._p, G._s
+    X, y = format_X_y(compute_neighbour_sums(x, G._ns_mats, np.max(s)), p, s)
+    n, d, _ = X.shape
+    # The stacked design of gnar_lr for the standard model
+    design = np.zeros([n * d, p * d])
+    for i in range(d):
+        design[i * n:(i + 1) * n, i::d] = X[:, i, :p]
+    design = np.hstack([design, np.transpose(X[:, :, p:], (1, 0, 2)).reshape(d * n, np.sum(s))])
+    valid = np.any(design != 0, axis=0)
+    exact = np.zeros(design.shape[1])
+    exact[valid] = np.linalg.lstsq(design[:, valid], y.T.reshape(-1), rcond=None)[0]
+    exact_mat = np.hstack([exact[:d * p].reshape(p, d).T, np.repeat(exact[d * p:].reshape(1, -1), d, axis=0)]).T
+    return float(np.max(np.abs(G.coeffs - exact_mat)) / np.max(np.abs(exact_mat)))
 
 
 def outputs(G: GNAR, ts_pred: np.ndarray, fitted: bool) -> dict:
@@ -138,7 +165,11 @@ def main(path: str) -> None:
                 continue
             for key, value in outputs(G, inputs["ts_pred"], fitted="ts" in inputs).items():
                 arrays[f"{i}/out/{key}"] = value
-    meta = dict(specs=specs, numpy=np.__version__, scipy=scipy.__version__, pandas=pd.__version__, gnar=gnar.__version__)
+            if "ts" in inputs and spec["model_type"] == "standard" and spec["method"] == "OLS":
+                arrays[f"{i}/lsqr_gap"] = np.array(lsqr_gap(G, inputs["ts"], spec["demean"]))
+    defaults = inspect.signature(lsqr).parameters
+    meta = dict(specs=specs, numpy=np.__version__, scipy=scipy.__version__, pandas=pd.__version__, gnar=gnar.__version__,
+                lsqr_defaults=dict(atol=defaults["atol"].default, btol=defaults["btol"].default))
     arrays["meta"] = np.array(json.dumps(meta))
     np.savez_compressed(path, **arrays)
     print(f"Wrote {len(specs)} cases to {path}")
