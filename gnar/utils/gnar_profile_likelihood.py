@@ -99,13 +99,23 @@ def _beta_parts(R: ResidualisedSums, degrees: np.ndarray, kappa: float) -> tuple
     return w, float(w @ R.c), float((w * w) @ R.d)
 
 
+def informative_nodes(M: NodeSums, R: ResidualisedSums, degrees: np.ndarray) -> np.ndarray:
+    """
+    Nodes that carry information on the network term: N_i >= 1 and a neighbour sum that is not a multiple of the node's
+    own lag, d_i > 0 (up to rounding, relative to ss_i). Only these nodes enter beta_hat and the kappa information.
+
+    Returns:
+        np.array of bool. Shape (d,)
+    """
+    return (np.asarray(degrees) > 0) & (R.d > 1e-12 * M.ss)
+
+
 def has_network_information(M: NodeSums, R: ResidualisedSums, degrees: np.ndarray) -> bool:
     """
     Whether the data carry information on beta: some node with N_i >= 1 has a neighbour sum that is not a multiple of its
-    own lag, d_i > 0 (up to rounding, relative to ss_i).
+    own lag (see informative_nodes).
     """
-    mask = np.asarray(degrees) > 0
-    return bool(np.any(R.d[mask] > 1e-12 * M.ss[mask]))
+    return bool(np.any(informative_nodes(M, R, degrees)))
 
 
 def fixed_kappa_ols(M: NodeSums, degrees: np.ndarray, kappa: float, R: ResidualisedSums | None = None) -> tuple[np.ndarray, float, float]:
@@ -239,13 +249,15 @@ def deviance(rss: float | np.ndarray, rss_min: float, n_obs: int, sigma_2: float
     return float(out) if out.ndim == 0 else out
 
 
-def kappa_identifiable(degrees: np.ndarray) -> bool:
+def kappa_identifiable(degrees: np.ndarray, informative: np.ndarray | None = None) -> bool:
     """
-    Whether the graph can identify kappa: at least two nodes with N_i >= 1 have different degrees. (kappa also needs
-    beta != 0; on a regular graph only beta N^(-kappa) is identified.)
+    Whether the degrees can identify kappa: at least two nodes with N_i >= 1 (by default), or at least two of the given
+    informative nodes, have different degrees. (kappa also needs beta != 0; on a regular graph only beta N^(-kappa) is
+    identified.)
     """
     degrees = np.asarray(degrees)
-    return np.unique(degrees[degrees > 0]).size >= 2
+    keep = degrees > 0 if informative is None else np.asarray(informative)
+    return np.unique(degrees[keep]).size >= 2
 
 
 def _count_local_minima(values: np.ndarray, tol: float) -> int:
@@ -258,6 +270,26 @@ def _count_local_minima(values: np.ndarray, tol: float) -> int:
     count = int(np.sum((signs[:-1] < 0) & (signs[1:] > 0)))
     count += int(signs[0] > 0) + int(signs[-1] < 0)
     return count
+
+
+def _polish(M: NodeSums, degrees: np.ndarray, R: ResidualisedSums, x0: float, a: float, b: float) -> float:
+    # Near its minimum RSS(kappa) is flat to rounding, so a minimiser resolves kappa only to about sqrt(machine epsilon)
+    # times its standard error; the root of the analytic derivative is resolved to machine precision. The root is
+    # bracketed around x0 (growing the bracket until RSS' changes sign) so that it is the stationary point the minimiser
+    # found, and it is kept only if its RSS is no worse than at x0
+    def slope(x):
+        return rss_derivative(M, degrees, x, R)
+
+    h = max(1e-9, 1e-6 * (b - a))
+    lower, upper = max(a, x0 - h), min(b, x0 + h)
+    while not (slope(lower) < 0 < slope(upper)):
+        if lower == a and upper == b:
+            return x0
+        h *= 4
+        lower, upper = max(a, x0 - h), min(b, x0 + h)
+    root = float(brentq(slope, lower, upper, xtol=1e-15, rtol=4 * np.finfo(float).eps))
+    rss_root, rss_x0 = fixed_kappa_ols(M, degrees, root, R)[2], fixed_kappa_ols(M, degrees, x0, R)[2]
+    return root if rss_root <= rss_x0 * (1 + TIE_RTOL) else x0
 
 
 def estimate_kappa(
@@ -274,16 +306,17 @@ def estimate_kappa(
 
         1. evaluate RSS(kappa) on a grid of `grid` equally spaced points spanning kappa_bounds;
         2. refine the best grid point with bounded Brent (scipy.optimize.minimize_scalar, method="bounded") on its two
-           neighbouring grid intervals, then polish it by solving RSS'(kappa) = 0 (see rss_derivative) with brentq on
-           that bracket when the derivative changes sign there, which locates the minimum to machine precision rather
-           than to the square root of it. When the best grid point is a bound and RSS still decreases towards it, the
-           estimate is that bound;
+           neighbouring grid intervals, then polish Brent's point by solving RSS'(kappa) = 0 (see rss_derivative) with
+           brentq on a small bracket around it, which locates the minimum to machine precision rather than to the square
+           root of it. When the best grid point is a bound and RSS still decreases towards it, the estimate is that
+           bound;
         3. warn when the optimum lies within 1e-3 of a bound ("boundary"), when the grid shows several local minima
            ("multimodal"), or when dev(kappa) stays below the chi-square(1) quantile at level flat_level at both bounds
            ("flat").
 
-    If kappa is not identified (fewer than two distinct degrees among nodes with N_i >= 1, or no information on beta),
-    no optimisation is done, kappa is NaN and only the "identifiability" warning is returned.
+    If kappa is not identified, no optimisation is done, kappa is NaN and only the "identifiability" warning is returned.
+    That is the case when the data carry no information on the network term, when the nodes that do (see
+    informative_nodes) all have the same degree, and when RSS(kappa) is constant to rounding (beta_hat = 0 for every kappa).
 
     Params:
         M: NodeSums.
@@ -308,13 +341,17 @@ def estimate_kappa(
     rss_grid = rss_profile(M, degrees, kappas, R)
     n_obs = len(degrees) * (M.n - 1)
 
-    if not has_network_information(M, R, degrees):
+    informative = informative_nodes(M, R, degrees)
+    message = None
+    if not np.any(informative):
         message = "kappa is not identified: the data carry no information on the network term (no edges, or neighbour sums proportional to the own lags)."
-        return KappaEstimate(np.nan, float(np.min(rss_grid)), kappas, rss_grid, False, [("identifiability", message)])
-    if not kappa_identifiable(degrees):
-        common = np.unique(np.asarray(degrees)[np.asarray(degrees) > 0])
-        message = (f"kappa is not identified: every node with neighbours has degree {common[0]:g}, so only beta * N^(-kappa) "
-                   "is identified (use beta_at at that degree).")
+    elif not kappa_identifiable(degrees, informative):
+        common = np.unique(np.asarray(degrees)[informative])
+        message = (f"kappa is not identified: every node that carries information on the network term has degree {common[0]:g}, "
+                   "so only beta * N^(-kappa) is identified (use beta_at at that degree).")
+    elif np.ptp(rss_grid) <= TIE_RTOL * np.min(rss_grid):
+        message = "kappa is not identified: RSS(kappa) is constant, so beta_hat = 0 for every kappa (no network effect in the data)."
+    if message is not None:
         return KappaEstimate(np.nan, float(np.min(rss_grid)), kappas, rss_grid, False, [("identifiability", message)])
 
     k = int(np.argmin(rss_grid))
@@ -328,11 +365,7 @@ def estimate_kappa(
         a, b = kappas[max(k - 1, 0)], kappas[min(k + 1, last)]
         res = minimize_scalar(lambda x: fixed_kappa_ols(M, degrees, float(x), R)[2], bounds=(a, b), method="bounded",
                               options={"xatol": 1e-10})
-        kappa_hat = float(res.x)
-        # Near its minimum RSS(kappa) is flat to rounding, so the minimiser alone resolves kappa only to about
-        # sqrt(machine epsilon) times its standard error; the root of the analytic derivative is resolved to machine precision
-        if rss_derivative(M, degrees, a, R) < 0 < rss_derivative(M, degrees, b, R):
-            kappa_hat = float(brentq(lambda x: rss_derivative(M, degrees, x, R), a, b, xtol=1e-15, rtol=4 * np.finfo(float).eps))
+        kappa_hat = _polish(M, degrees, R, float(res.x), a, b)
         # Keep the grid point if it is genuinely better (beyond rounding) than the refined point
         if rss_grid[k] < fixed_kappa_ols(M, degrees, kappa_hat, R)[2] * (1 - TIE_RTOL):
             kappa_hat = float(kappas[k])

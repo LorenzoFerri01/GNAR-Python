@@ -431,3 +431,236 @@ class TestPlotProfile:
         X = np.random.default_rng(0).standard_normal((50, 3))
         with pytest.raises(ValueError, match="fixed"):
             plot_profile(fit_gnar1(path_graph(3), X, kappa=1.0, demean=False))
+
+
+class TestInformativeNodes:
+    """kappa is identified by the degrees of the nodes that carry information on the network term, not by the graph alone."""
+
+    def test_dead_neighbours(self):
+        # Node 0 (degree 2) has two constant neighbours, so after demeaning its neighbour sum is 0 and it carries no
+        # information; the informative nodes all have degree 1, so RSS(kappa) is constant and only beta is identified
+        A = np.zeros((5, 5))
+        for i, j in [(0, 1), (0, 2), (3, 4)]:
+            A[i, j] = A[j, i] = 1
+        X = np.random.default_rng(0).standard_normal((400, 5))
+        X[:, 1], X[:, 2] = 2.0, -1.0
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fit = fit_gnar1(A, X, demean=True)
+        assert [w.category for w in caught if issubclass(w.category, KappaWarning)] == [KappaIdentifiabilityWarning]
+        # The message names the common degree of the informative nodes, at which beta_at gives the identified quantity
+        assert "degree 1" in str(caught[-1].message)
+        assert np.isnan(fit.kappa) and np.isfinite(fit.beta)
+        assert fit.beta == pytest.approx(fit_gnar1(A, X, kappa=1.0, demean=True).beta, rel=1e-12)
+        # The GNAR route agrees and falls back to kappa = 1 for the weights
+        G = quiet_gnar(A, X)
+        assert G.kappa == 1.0 and np.isnan(G.kappa_fit.kappa)
+
+    def test_constant_hub(self):
+        # A constant hub: beta_hat = 0 for every kappa, RSS(kappa) is constant
+        A = star_graph(6)
+        X = np.random.default_rng(1).standard_normal((300, 7))
+        X[:, 0] = 5.0
+        with pytest.warns(KappaIdentifiabilityWarning):
+            fit = fit_gnar1(A, X, demean=True)
+        assert np.isnan(fit.kappa)
+
+    def test_beta_hat_zero_with_distinct_degrees(self):
+        # Informative nodes of degrees 2 and 3 whose own series are constant after demeaning: c_i = 0, so beta_hat = 0
+        # for every kappa although the degrees differ
+        A = np.zeros((7, 7))
+        for i, j in [(0, 2), (0, 3), (1, 4), (1, 5), (1, 6)]:
+            A[i, j] = A[j, i] = 1
+        X = np.random.default_rng(2).standard_normal((300, 7))
+        X[:, 0], X[:, 1] = 1.0, -2.0
+        with pytest.warns(KappaIdentifiabilityWarning, match="constant"):
+            fit = fit_gnar1(A, X, demean=True)
+        assert np.isnan(fit.kappa)
+
+    def test_isolated_node_with_regular_core(self):
+        # The isolated node's degree 0 must not make the cycle look heterogeneous
+        A = with_isolated_node(cycle_graph(8))
+        X = simulate_gnar1(A, 0.2, 0.3, 1.0, 500, rng=2)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fit = fit_gnar1(A, X, demean=False)
+        assert [w.category for w in caught if issubclass(w.category, KappaWarning)] == [KappaIdentifiabilityWarning]
+        assert "degree 2" in str(caught[-1].message)
+        assert np.isnan(fit.kappa)
+        x = X[:, -1]
+        assert fit.alpha[-1] == pytest.approx(np.linalg.lstsq(x[:-1, None], x[1:], rcond=None)[0][0], rel=1e-12)
+
+
+class TestOptimiserEdgeCases:
+
+    def test_polish_keeps_brents_minimum_on_a_bimodal_bracket(self):
+        # With grid = 3 the Brent bracket is the whole range; the profile below has minima near 0.283 (global) and 0.987.
+        # The derivative polish must refine Brent's minimum, not jump to the other stationary point
+        from gnar.utils.gnar_profile_likelihood import NodeSums, estimate_kappa
+        degrees = np.array([1, 2, 3, 5, 8, 13, 21, 34, 55, 89], dtype=float)
+        c = np.array([0.03197, 6.0784, 0.85671, 3.0472, -0.0017539, -2.1379, 0.033632, 0.37035, 9.7669, -0.35388])
+        dd = np.array([0.19293, 6.7033, 6.4925, 13.514, 0.41279, 3.0303, 2.0585, 13.764, 12.180, 6.0970])
+        M0 = NodeSums(xx=np.ones(10), xy=np.zeros(10), xs=np.zeros(10), ss=dd, sy=c, yy=np.ones(10), n=1000)
+        kappas = np.linspace(0, 1.5, 3001)
+        explained = np.max([(np.exp(-k * np.log(degrees)) @ c) ** 2 / (np.exp(-2 * k * np.log(degrees)) @ dd) for k in kappas])
+        M = M0._replace(yy=np.full(10, 1.2 * explained / 10))
+        coarse = estimate_kappa(M, degrees, (0.0, 1.5), grid=3)
+        fine = estimate_kappa(M, degrees, (0.0, 1.5), grid=201)
+        assert coarse.kappa == pytest.approx(0.283174, abs=1e-5)
+        assert coarse.kappa == pytest.approx(fine.kappa, abs=1e-7)
+        assert "multimodal" in [code for code, _ in fine.warnings]
+
+    def test_near_bound_behaviour(self):
+        # The boundary warning fires within 1e-3 of a bound, and not when the interior optimum is 2e-3 away
+        A = random_tree(10, seed=11)
+        X, _, _ = simulate(A, 1.0, 2000, seed=12)
+        k = fit_gnar1(A, X, demean=False).kappa
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", KappaWarning)
+            clear = fit_gnar1(A, X, kappa_bounds=(0.0, k + 0.002), demean=False)
+        assert clear.kappa == pytest.approx(k, abs=1e-9)
+        with pytest.warns(KappaBoundaryWarning):
+            close = fit_gnar1(A, X, kappa_bounds=(0.0, k + 0.0005), demean=False)
+        assert close.kappa == pytest.approx(k, abs=1e-9)
+
+    def test_boundary_case_warns_only_about_the_boundary(self):
+        # Acceptance test 13 setting: exactly the boundary warning, no spurious flat-profile or multimodal warning
+        A = random_tree(10, seed=11)
+        X, _, _ = simulate(A, 1.0, 2000, seed=12)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fit_gnar1(A, X, kappa_bounds=(0, 0.5), demean=False)
+        assert [w.category for w in caught if issubclass(w.category, KappaWarning)] == [KappaBoundaryWarning]
+
+    def test_flat_profile_also_reports_multimodality(self):
+        A = random_tree(10, seed=15)
+        rng = np.random.default_rng(16)
+        X = simulate_gnar1(A, rng.uniform(0.1, 0.4, 10), 0.005, 0.7, 60, rng=rng)
+        fit = quiet_fit(A, X, demean=False)
+        codes = [code for code, _ in fit.warnings]
+        assert "flat" in codes and "multimodal" in codes
+
+
+class TestWarningLocation:
+    """Warnings point at the user's call, so Python's once-per-location filter does not hide them across fits."""
+
+    def test_direct_and_gnar_calls(self):
+        A = cycle_graph(6)
+        X = simulate_gnar1(A, 0.2, 0.3, 0.5, 300, rng=28)
+        for call in (lambda: fit_gnar1(A, X, demean=False), lambda: GNAR(A, p=1, s=np.array([1]), ts=X, kappa=None)):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                call()
+            assert caught and all(w.filename == __file__ for w in caught if issubclass(w.category, KappaWarning))
+        G = quiet_gnar(A, X)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            G.fit(X)
+        assert caught and all(w.filename == __file__ for w in caught if issubclass(w.category, KappaWarning))
+
+
+def quiet_gnar(A, X, **kwargs):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", KappaWarning)
+        return GNAR(A, p=1, s=np.array([1]), ts=X, kappa=None, **kwargs)
+
+
+class TestGNARKappaState:
+
+    def test_failed_refit_leaves_model_unchanged(self):
+        A = random_tree(10, seed=24)
+        X, _, _ = simulate(A, 0.7, 1000, seed=25)
+        G = GNAR(A, p=1, s=np.array([1]), ts=X, kappa=None)
+        before = (G._n, G.mu.copy(), G.coeffs.copy(), G.kappa, G.predict(h=1).copy())
+        with pytest.raises(NotImplementedError):
+            G.fit(X[:500] + 10.0, method="YW")
+        bad = X[:100] + 50.0
+        bad[3, 2] = np.nan
+        with pytest.raises(ValueError):
+            G.fit(bad)
+        after = (G._n, G.mu, G.coeffs, G.kappa, G.predict(h=1))
+        assert after[0] == before[0] and after[3] == before[3]
+        for a, b in zip(before[1:3] + before[4:], after[1:3] + after[4:]):
+            np.testing.assert_array_equal(a, b)
+        assert np.array_equal(G.kappa_fit.mu, G.mu)
+
+    def test_unidentified_kappa_in_gnar(self):
+        A = cycle_graph(6)
+        X = simulate_gnar1(A, 0.2, 0.3, 0.5, 300, rng=28)
+        G = quiet_gnar(A, X)
+        fixed = GNAR(A, p=1, s=np.array([1]), ts=X, kappa=1.0)
+        # kappa is not counted: the fit is the kappa = 1 fit
+        assert G._num_params() == fixed._num_params() == 7
+        assert G.bic() == pytest.approx(fixed.bic(), rel=1e-6)
+        assert "kappa: not identified" in str(G) and "kappa=nan" in repr(G)
+        assert G.kappa_fit.num_params == 7
+
+    def test_kappa_bounds_sigma_2_and_mean(self):
+        A = random_tree(10, seed=11)
+        X, _, _ = simulate(A, 1.0, 2000, seed=12)
+        with pytest.warns(KappaBoundaryWarning):
+            G = GNAR(A, p=1, s=np.array([1]), ts=X + 3.0, kappa=None, kappa_bounds=(0, 0.5))
+        assert G.kappa == 0.5
+        # The mean is removed once, and the fit object reports it
+        np.testing.assert_allclose(G.mu, (X + 3.0).mean(axis=0, keepdims=True), rtol=1e-14)
+        np.testing.assert_array_equal(G.kappa_fit.mu, G.mu)
+        # sigma_2 is the legacy residual covariance R^T R / (T - 2) at kappa_hat
+        fit = G.kappa_fit
+        x = X + 3.0 - G.mu
+        _, _, w = degree_terms(node_degrees(A), G.kappa)
+        R = x[1:] - fit.alpha * x[:-1] - fit.beta * w * (x[:-1] @ A)
+        np.testing.assert_allclose(G.sigma_2, R.T @ R / (len(X) - 2), rtol=1e-10)
+        with pytest.raises(ValueError, match="kappa_bounds"):
+            GNAR(A, p=1, s=np.array([1]), ts=X, kappa=None, kappa_bounds=(1.0, 0.5))
+
+
+class TestFitValidation:
+
+    @pytest.mark.parametrize("kwargs, match", [
+        (dict(sigma_2=0.0), "sigma_2"),
+        (dict(sigma_2=True), "sigma_2"),
+        (dict(sigma_2="1"), "sigma_2"),
+        (dict(sigma_2=np.ones(3)), "sigma_2"),
+        (dict(kappa_bounds=(0, 1, 2)), "kappa_bounds"),
+        (dict(kappa_bounds=("0", "1")), "kappa_bounds"),
+        (dict(kappa=0.5, kappa_bounds=(3, -1)), "kappa_bounds"),
+        (dict(kappa=0.5, grid=1), "grid"),
+        (dict(demean=None), "demean"),
+        (dict(demean="no"), "demean"),
+    ])
+    def test_invalid_arguments(self, kwargs, match):
+        args = dict(demean=False)
+        args.update(kwargs)
+        X = np.random.default_rng(0).standard_normal((20, 3))
+        with pytest.raises(ValueError, match=match):
+            quiet_fit(path_graph(3), X, **args)
+
+    def test_minimum_observations(self):
+        # With kappa fixed there are d + 1 parameters: a 2-node graph with T = 3 has n = 4 observations and one residual
+        # degree of freedom
+        X = np.random.default_rng(0).standard_normal((3, 2))
+        fit = fit_gnar1(path_graph(2), X, kappa=1.0, demean=False)
+        assert np.isfinite(fit.sigma_2)
+        # With kappa estimated there are d + 2 = 4 parameters for the same 4 observations
+        with pytest.raises(ValueError, match="Too few observations"):
+            fit_gnar1(path_graph(2), X, demean=False)
+
+
+class TestPlotProfileDetails:
+
+    def test_axes_lines_and_limits(self):
+        import matplotlib.pyplot as plt
+        A = random_tree(10, seed=29)
+        X, _, _ = simulate(A, 0.7, 1000, seed=30)
+        fit = fit_gnar1(A, X, demean=False)
+        plt.close("all")
+        fig, ax = plt.subplots()
+        assert plot_profile(fit, ax=ax, level=0.9) is ax
+        assert plt.get_fignums() == [fig.number]
+        lines = {line.get_label().split(" ")[0]: line for line in ax.get_lines()}
+        np.testing.assert_allclose(lines["κ̂"].get_xdata(), [fit.kappa, fit.kappa])
+        cutoff = chi2.ppf(0.9, 1)
+        assert lines["χ²₁"].get_ydata()[0] == pytest.approx(cutoff)
+        dev = fit.profile["deviance"]
+        assert ax.get_ylim() == pytest.approx((0, max(1.5 * cutoff, min(dev.max(), 5 * cutoff)) * 1.05))
+        plt.close("all")

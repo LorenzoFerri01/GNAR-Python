@@ -11,7 +11,7 @@ from gnar.utils.simulating import shift_X, generate_noise
 from gnar.utils.neighbour_sets import *
 from gnar.utils.data_utils import *
 from gnar.var import VAR
-from gnar.gnar_kappa import fit_gnar1
+from gnar.gnar_kappa import fit_gnar1, check_kappa_bounds
 from gnar.utils.gnar_profile_likelihood import fixed_kappa_ols
 
 class GNAR:
@@ -67,6 +67,8 @@ class GNAR:
         gnar_checks(A, p, s, model_type, net_type, kappa)
         if kappa is None and ts is None:
             raise ValueError("kappa=None (estimate kappa) requires time series data (ts).")
+        if kappa is None:
+            kappa_bounds = check_kappa_bounds(kappa_bounds)
 
         self._A = A
         self._p = p
@@ -121,6 +123,10 @@ class GNAR:
             ts (np.ndarray or pd.DataFrame): The input time series data. Shape (n, d) where n is the number of observations and d is the number of nodes.
             demean (bool): Whether to remove the mean from the data.
         """
+        if self._kappa_spec is None:
+            # Estimate kappa by profile likelihood; the neighbour set matrices are rebuilt at the estimate on every fit
+            self._fit_kappa(ts, demean, method)
+            return
         self._n, self._d = np.shape(ts)
         self._ts = ts
         if isinstance(ts, pd.DataFrame):
@@ -134,13 +140,6 @@ class GNAR:
             ts = ts - self.mu
         else:
             self.mu = np.zeros((1, self._d))
-
-        if self._kappa_spec is None:
-            # Estimate kappa by profile likelihood; the neighbour set matrices are rebuilt at the estimate on every fit
-            if method != "OLS":
-                raise NotImplementedError("Estimating kappa (kappa=None) is only implemented for method='OLS'.")
-            self._fit_kappa(ts)
-            return
 
         # Compute the neighbour sums up to the maximum stage of neighbour dependence. This is an array of shape (n, d, 1 + r), where r = max(s)
         data = compute_neighbour_sums(ts, self._ns_mats, np.max(self._s))
@@ -161,21 +160,31 @@ class GNAR:
         else:
             raise ValueError("Method must be one of 'OLS' or 'YW'.")
 
-    def _fit_kappa(self, ts: np.ndarray) -> None:
-        # Fit the kappa-normalised GNAR(1, [1]) standard model to the (already demeaned) data, estimating kappa
-        fit = fit_gnar1(self._A, ts, kappa=None, kappa_bounds=self._kappa_bounds, demean=False)
-        fit.mu = self.mu
-        fit.names = self._names
-        self.kappa_fit = fit
+    def _fit_kappa(self, ts: np.ndarray | pd.DataFrame, demean: bool, method: str) -> None:
+        # Fit the kappa-normalised GNAR(1, [1]) standard model, estimating kappa. Everything is computed before the object
+        # is updated, so a fit that fails (bad method or data) leaves the previous fit intact
+        if method != "OLS":
+            raise NotImplementedError("Estimating kappa (kappa=None) is only implemented for method='OLS'.")
+        n, d = np.shape(ts)
+        if isinstance(ts, pd.DataFrame):
+            names, values = ts.columns, ts.to_numpy()
+        else:
+            names, values = np.arange(1, d + 1), ts
+        mu = np.mean(values, axis=0, keepdims=True) if demean else np.zeros((1, d))
+        x = values - mu
+        fit = fit_gnar1(self._A, x, kappa=None, kappa_bounds=self._kappa_bounds, demean=False)
         # If kappa is not identified the fitted values do not depend on it, and kappa = 1 is used for the weights
-        self._kappa = fit.kappa if np.isfinite(fit.kappa) else 1.0
-        self._ns_mats = neighbour_set_mats(self._A, 1, self._net_type, self._kappa)
-        alpha, beta, _ = fixed_kappa_ols(fit._M, fit.degrees, self._kappa, fit._R)
-        self.coeffs = np.vstack([alpha, np.full(self._d, beta)])
+        kappa = fit.kappa if np.isfinite(fit.kappa) else 1.0
+        ns_mats = neighbour_set_mats(self._A, 1, self._net_type, kappa)
+        alpha, beta, _ = fixed_kappa_ols(fit._M, fit.degrees, kappa, fit._R)
+        coeffs = np.vstack([alpha, np.full(d, beta)])
         # Residual covariance computed as in gnar_lr (divisor n - 2 for p = 1), so bic and aic work as for other models
-        X, y = format_X_y(compute_neighbour_sums(ts, self._ns_mats, 1), 1, self._s)
-        res = np.sum(X * self.coeffs.T, axis=2) - y
-        self.sigma_2 = res.T @ res / (X.shape[0] - 1)
+        X, y = format_X_y(compute_neighbour_sums(x, ns_mats, 1), 1, self._s)
+        res = np.sum(X * coeffs.T, axis=2) - y
+        fit.mu, fit.names = mu, names
+        self._n, self._d, self._ts, self._names, self.mu = n, d, ts, names, mu
+        self.kappa_fit, self._kappa, self._ns_mats = fit, kappa, ns_mats
+        self.coeffs, self.sigma_2 = coeffs, res.T @ res / (X.shape[0] - 1)
 
     def predict(self, ts: np.ndarray | pd.DataFrame | None = None, h: int = 1) -> np.ndarray | pd.DataFrame:
         """
@@ -326,8 +335,8 @@ class GNAR:
         return det + 2 * k / (self._n - self._p)
 
     def _num_params(self) -> int:
-        # Compute the number of parameters in the model, counting kappa if it is estimated
-        k_kappa = int(self._kappa_spec is None)
+        # Compute the number of parameters in the model, counting kappa if it is estimated and identified
+        k_kappa = int(self._kappa_spec is None and np.isfinite(self.kappa_fit.kappa))
         if self._model_type == "global":
             return self._p + np.sum(self._s) + k_kappa
         elif self._model_type == "standard":
@@ -343,8 +352,14 @@ class GNAR:
         # kappa is only displayed when it differs from the standard GNAR normalisation or was estimated
         return self._kappa_spec is None or self._kappa != 1.0
 
+    def _kappa_unidentified(self) -> bool:
+        # kappa was estimated but is not identified (the weights then use kappa = 1)
+        return self._kappa_spec is None and hasattr(self, "kappa_fit") and not np.isfinite(self.kappa_fit.kappa)
+
     def _kappa_text(self) -> str:
         # Short display of kappa that never rounds a value other than 1 to "1"
+        if self._kappa_unidentified():
+            return "nan"
         text = f"{self._kappa:g}"
         return repr(self._kappa) if text == "1" and self._kappa != 1.0 else text
 
@@ -398,7 +413,9 @@ class GNAR:
             index += [f"b_{i},{j}" for j in range(1, self._s[i - 1] + 1)]
         parameters = pd.DataFrame(np.vstack([self.mu, self.coeffs]), columns=self._names, index=index)
         parameter_info = f"Parameters:\n{parameters}\n"
-        if self._show_kappa():
+        if self._kappa_unidentified():
+            parameter_info += "kappa: not identified (the weights use kappa = 1)\n"
+        elif self._show_kappa():
             status = "estimated" if self._kappa_spec is None else "fixed"
             parameter_info += f"kappa: {self._kappa_text()} ({status})\n"
         cov = pd.DataFrame(cov_mat(self.sigma_2, self._d), index=self._names, columns=self._names)
