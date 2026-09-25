@@ -45,7 +45,8 @@ def beta_kappa_cov(R: ResidualisedSums, degrees: np.ndarray, beta: float, kappa:
 
     With kappa fixed (known) Var(beta_hat) = sigma^2 / sum_i w_i and the kappa entries are NaN. When kappa is not identified
     (S_kappa(w) = 0, e.g. a regular graph) or beta = 0, Var(kappa_hat) is infinite and the covariance NaN; Var(beta_hat) is
-    then infinite too unless every node with neighbours has degree 1, where beta is still identified.
+    then infinite too unless every node with neighbours has degree 1, where beta is still identified. Without network
+    information (sum_i w_i = 0) beta is not estimated and Var(beta_hat) is NaN.
 
     Params:
         R: ResidualisedSums.
@@ -63,12 +64,14 @@ def beta_kappa_cov(R: ResidualisedSums, degrees: np.ndarray, beta: float, kappa:
     s0, s1, s2, S_kappa, S_beta = weighted_degree_sums(w, degrees)
     cov = np.full((2, 2), np.nan)
     if not kappa_estimated:
-        cov[0, 0] = sigma_2 / s0 if s0 > 0 else np.inf
+        # Without network information (s0 = 0) beta is not estimated
+        cov[0, 0] = sigma_2 / s0 if s0 > 0 else np.nan
         return cov
     identified = S_kappa > 1e-12 * s2 and beta != 0
     if not identified:
         cov[1, 1] = np.inf
-        cov[0, 0] = sigma_2 / s0 if (s2 == 0 and s0 > 0) else np.inf
+        if s0 > 0:
+            cov[0, 0] = sigma_2 / s0 if s2 == 0 else np.inf
         return cov
     cov[1, 1] = sigma_2 / (beta * beta * S_kappa)
     cov[0, 0] = sigma_2 / S_beta

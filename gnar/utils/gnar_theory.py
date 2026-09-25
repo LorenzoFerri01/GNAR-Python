@@ -41,9 +41,13 @@ def asymptotic_cov(A, alpha, beta: float, kappa: float, sigma_2: float = 1.0, n:
     with sums over nodes with N_i >= 1, and the asymptotic covariance is sigma^2 F^(-1) / (T - 1). Since Gamma0 scales with
     sigma^2, the result does not depend on sigma_2.
 
-    If kappa is not identified (fewer than two distinct degrees among nodes with N_i >= 1, or beta = 0) a warning is raised
-    and Var(kappa_hat) is infinite. Then the alpha block (and beta, when every node with neighbours has degree 1) comes
-    from the information with kappa known, and the other entries are infinite or NaN.
+    If kappa is not identified a warning is raised and Var(kappa_hat) is infinite:
+        - every node with neighbours has degree 1: N_i^(-kappa) = 1, so the (alpha, beta) block is the one with kappa
+          known;
+        - all nodes with neighbours share a degree above 1 (a regular graph): only beta N^(-kappa) is identified, so the
+          alpha block is the one with kappa known and Var(beta_hat) is infinite;
+        - beta = 0 (otherwise): kappa does not enter the model, the estimators are non-regular and no information-matrix
+          variance applies, so the other entries are NaN (use a small non-zero beta for the limit).
 
     Params:
         A: np.array or scipy.sparse matrix. Binary, symmetric adjacency matrix with no self-loops. Shape (d, d)
@@ -70,16 +74,19 @@ def asymptotic_cov(A, alpha, beta: float, kappa: float, sigma_2: float = 1.0, n:
     if kappa_identifiable(degrees) and beta != 0:
         return factor * np.linalg.inv(F)
     warnings.warn("kappa is not identified (a regular graph, or beta = 0): its asymptotic variance is infinite.", UserWarning, stacklevel=2)
-    # The information with kappa known gives the identified block. beta is identified when every node with neighbours has
-    # degree 1 (N_i^(-kappa) = 1 for all kappa), or when beta = 0 on a graph that would identify kappa
     cov = np.full((d + 2, d + 2), np.nan)
-    known = factor * np.linalg.inv(F[:d + 1, :d + 1])
-    beta_identified = bool(np.all(degrees[degrees > 0] == 1)) or (beta == 0 and kappa_identifiable(degrees))
-    keep = d + 1 if beta_identified else d
-    cov[:keep, :keep] = known[:keep, :keep]
-    if not beta_identified:
-        cov[d, d] = np.inf
     cov[d + 1, d + 1] = np.inf
+    degree_one = bool(np.all(degrees[degrees > 0] == 1))
+    if beta == 0 and not degree_one:
+        # kappa does not enter the model: non-regular estimators, no information-matrix variance
+        return cov
+    # The information with kappa known gives the identified block: (alpha, beta) when every node with neighbours has
+    # degree 1 (N_i^(-kappa) = 1 for all kappa), alpha alone on a regular graph (only beta N^(-kappa) is identified)
+    known = factor * np.linalg.inv(F[:d + 1, :d + 1])
+    keep = d + 1 if degree_one else d
+    cov[:keep, :keep] = known[:keep, :keep]
+    if not degree_one:
+        cov[d, d] = np.inf
     return cov
 
 
@@ -92,7 +99,8 @@ def closed_form_variances(A, alpha, beta: float, kappa: float, sigma_2: float = 
 
     where S_kappa(g) = sum_i g_i log^2 N_i - (sum_i g_i log N_i)^2 / sum_i g_i and
     S_beta(g) = sum_i g_i - (sum_i g_i log N_i)^2 / sum_i g_i log^2 N_i, over nodes with N_i >= 1. On a regular graph
-    S_kappa = 0 and the variances are infinite (with a warning).
+    S_kappa = 0 and the variances are infinite (with a warning), except Var(beta_hat) when every node with neighbours
+    has degree 1. At beta = 0 kappa does not enter the model and Var(beta_hat) is NaN (non-regular; see asymptotic_cov).
 
     Params: as asymptotic_cov.
 
@@ -106,7 +114,10 @@ def closed_form_variances(A, alpha, beta: float, kappa: float, sigma_2: float = 
     factor = sigma_2 * _per_period(n)
     if not kappa_identifiable(degrees) or beta == 0:
         warnings.warn("kappa is not identified (a regular graph, or beta = 0): S_kappa = 0 and its variance is infinite.", UserWarning, stacklevel=2)
-        var_beta = factor / S_beta if s2 == 0 else np.inf
+        if s2 == 0:
+            var_beta = factor / S_beta
+        else:
+            var_beta = np.nan if beta == 0 else np.inf
         return {"kappa": np.inf, "beta": var_beta}
     return {"kappa": factor / (beta ** 2 * S_kappa), "beta": factor / S_beta}
 
