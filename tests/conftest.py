@@ -2,6 +2,20 @@ import numpy as np
 import pytest
 
 
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False, help="run the slow Monte Carlo tests")
+
+
+def pytest_collection_modifyitems(config, items):
+    # Slow Monte Carlo tests (marked @pytest.mark.slow) are skipped unless --runslow is given
+    if config.getoption("--runslow"):
+        return
+    skip_slow = pytest.mark.skip(reason="slow Monte Carlo test; run with --runslow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.fixture
 def path_graph_3():
     """3-node path graph: 0--1--2."""
