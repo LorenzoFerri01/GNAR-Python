@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 
 import numpy as np
@@ -9,7 +11,8 @@ from scipy.stats import chi2
 from gnar.utils.data_utils import check_kappa, check_kappa_graph
 from gnar.utils.neighbour_sets import node_degrees
 from gnar.utils.gnar_profile_likelihood import (node_sums, residualised_sums, fixed_kappa_ols, estimate_kappa,
-                                                profile_loglik, deviance, has_network_information)
+                                                profile_loglik, deviance, has_network_information, informative_nodes)
+from gnar.utils.simulating import _check_sigma_2
 from gnar.utils.gnar_inference import (beta_kappa_cov, cov_fast, var_fast, wald_ci, wald_test, profile_ci,
                                        beta_at_reference)
 
@@ -41,6 +44,37 @@ _WARNING_CLASSES = {
     "identifiability": KappaIdentifiabilityWarning,
 }
 
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+def _warn_outside_package(message: str, category: type) -> None:
+    # Attribute the warning to the first caller outside the gnar package, whether the user called fit_gnar1 directly or
+    # through GNAR, so that the location (and the default once-per-location filter) refers to the user's code
+    frame, level = sys._getframe(1), 1
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(_PACKAGE_DIR):
+        frame, level = frame.f_back, level + 1
+    warnings.warn(message, category, stacklevel=level + 1)
+
+
+def check_kappa_bounds(kappa_bounds) -> tuple[float, float]:
+    """
+    Check the bounds of the search for kappa: two finite real numbers with lower < upper.
+
+    Returns:
+        (lower, upper) as floats.
+    """
+    try:
+        lo, hi = kappa_bounds
+    except (TypeError, ValueError):
+        raise ValueError("kappa_bounds must be a pair (lower, upper).") from None
+    for b in (lo, hi):
+        if isinstance(b, (bool, np.bool_)) or not isinstance(b, (int, float, np.integer, np.floating)):
+            raise ValueError("kappa_bounds must contain two real numbers.")
+    lo, hi = float(lo), float(hi)
+    if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+        raise ValueError("kappa_bounds must be two finite numbers with lower < upper.")
+    return lo, hi
+
 
 class GNARKappaFit:
     """
@@ -55,7 +89,8 @@ class GNARKappaFit:
         beta (float): Estimate of beta (NaN if not identified).
         kappa (float): Estimate of kappa, or its fixed value (NaN if estimated but not identified).
         sigma_2 (float): Noise variance: RSS / (n_obs - p) with p = d + 2 (kappa estimated) or d + 1 (kappa fixed), or
-            the fixed value passed to fit_gnar1. When kappa (or beta) is not identified it does not count in p.
+            the fixed value passed to fit_gnar1. A parameter that is not identified (kappa on a regular graph, beta
+            without network information) is not counted in p.
         rss (float): Residual sum of squares RSS(kappa_hat).
         loglik (float): Profile log-likelihood at kappa_hat (see gnar.utils.gnar_profile_likelihood.profile_loglik).
         se (np.ndarray): Standard errors of theta_hat, from the full Jacobian at theta_hat, so they account for estimating
@@ -84,8 +119,9 @@ class GNARKappaFit:
 
     @property
     def num_params(self) -> int:
-        # Number of estimated mean parameters: d alphas, beta and, if estimated, kappa
-        return self.d + 1 + int(self.kappa_estimated)
+        # Number of identified mean parameters (the p in sigma_2 = RSS / (n_obs - p)): d alphas, beta if the data carry
+        # information on it, and kappa if it was estimated and is identified
+        return self._num_params
 
     @property
     def cov(self) -> np.ndarray:
@@ -350,8 +386,13 @@ def fit_gnar1(
     """
     A = check_kappa_graph(A)
     kappa = check_kappa(kappa)
-    if sigma_2 is not None and not (np.isfinite(sigma_2) and sigma_2 > 0):
-        raise ValueError("sigma_2 must be a positive number or None.")
+    if sigma_2 is not None:
+        sigma_2 = _check_sigma_2(sigma_2)
+    kappa_bounds = check_kappa_bounds(kappa_bounds)
+    if isinstance(grid, (bool, np.bool_)) or not isinstance(grid, (int, np.integer)) or grid < 3:
+        raise ValueError("grid must be an integer of at least 3.")
+    if not isinstance(demean, (bool, np.bool_)):
+        raise ValueError("demean must be True or False.")
     d = A.shape[0]
     ts, names = _check_ts(ts, d)
     mu = np.mean(ts, axis=0, keepdims=True) if demean else np.zeros((1, d))
@@ -362,8 +403,8 @@ def fit_gnar1(
     M = node_sums(x, A)
     R = residualised_sums(M)
     kappa_estimated = kappa is None
-    if sigma_2 is None and n_obs <= d + 2:
-        raise ValueError(f"Too few observations ({n_obs}) for {d + 2} parameters.")
+    if sigma_2 is None and n_obs <= d + 1 + int(kappa_estimated):
+        raise ValueError(f"Too few observations ({n_obs}) for {d + 1 + int(kappa_estimated)} parameters.")
 
     profile = None
     if kappa_estimated:
@@ -373,13 +414,13 @@ def fit_gnar1(
             kappa_hat = est.kappa
             alpha, beta, rss = fixed_kappa_ols(M, degrees, kappa_hat, R)
         else:
-            # The fitted values do not depend on kappa, so alpha and RSS come from any kappa (here 1). beta is identified
-            # only when every node with neighbours has degree 1 (then N_i^(-kappa) = 1), or trivially 0 without network
-            # information
+            # The fitted values do not depend on kappa, so alpha and RSS come from any kappa (here 1). beta is not
+            # identified when the informative nodes share one degree above 1 (only beta N^(-kappa) is); with degree 1,
+            # without network information (beta = 0) or with beta_hat = 0 for every kappa, beta_hat is well defined
             kappa_hat = np.nan
             alpha, beta, rss = fixed_kappa_ols(M, degrees, 1.0, R)
-            common = np.unique(degrees[degrees > 0])
-            if has_network_information(M, R, degrees) and not (common.size == 1 and common[0] == 1):
+            common = np.unique(degrees[informative_nodes(M, R, degrees)])
+            if common.size == 1 and common[0] > 1:
                 beta = np.nan
         rss_min = min(float(np.min(est.rss_grid)), rss)
         profile = {"kappa": est.grid, "rss": est.rss_grid, "loglik": profile_loglik(est.rss_grid, n_obs, sigma_2),
@@ -401,12 +442,12 @@ def fit_gnar1(
         cov_bk[1, 1] = np.inf
 
     for code, message in found:
-        warnings.warn(message, _WARNING_CLASSES[code], stacklevel=2)
+        _warn_outside_package(message, _WARNING_CLASSES[code])
 
     return GNARKappaFit(
         alpha=alpha, beta=float(beta), kappa=float(kappa_hat), sigma_2=sigma_2_hat, rss=float(rss),
         loglik=profile_loglik(rss, n_obs, sigma_2), n_obs=n_obs, n=n, d=d, degrees=degrees, mu=mu, names=names,
-        kappa_estimated=kappa_estimated, kappa_bounds=tuple(float(b) for b in kappa_bounds), sigma_2_fixed=sigma_2 is not None,
+        kappa_estimated=kappa_estimated, kappa_bounds=kappa_bounds, sigma_2_fixed=sigma_2 is not None, _num_params=p,
         profile=profile, warnings=found, _cov_beta_kappa=cov_bk, _A=A, _M=M, _R=R, _ts=x,
     )
 

@@ -76,11 +76,10 @@ def _gnar1_setup(A, alpha: float | np.ndarray, beta: float, kappa: float) -> tup
     return A, alpha, beta, kappa, node_degrees(A)
 
 def _check_sigma_2(sigma_2) -> float:
-    # The noise variance must be a positive, finite number
-    try:
-        sigma_2 = float(sigma_2)
-    except (TypeError, ValueError):
-        raise ValueError("sigma_2 must be a positive number.") from None
+    # The noise variance must be a positive, finite real number (not a bool, string or array)
+    if isinstance(sigma_2, (bool, np.bool_)) or not isinstance(sigma_2, (int, float, np.integer, np.floating)):
+        raise ValueError("sigma_2 must be a positive number.")
+    sigma_2 = float(sigma_2)
     if not (np.isfinite(sigma_2) and sigma_2 > 0):
         raise ValueError("sigma_2 must be a positive, finite number.")
     return sigma_2
