@@ -4,6 +4,7 @@ Tests for kappa in the model specification and the simulator (pull request 1).
 Acceptance tests covered here: 1 (backward compatibility, parts a and b), 2 (design matrix on a 4-node path) and
 11 (stationarity checks).
 """
+import inspect
 import json
 import pathlib
 import warnings
@@ -12,9 +13,10 @@ import numpy as np
 import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import lsqr
 
 from gnar import GNAR, simulate_gnar1, stationary_params
-from gnar.utils.data_utils import check_kappa_graph
+from gnar.utils.data_utils import check_kappa_graph, cov_mat
 from gnar.utils.gnar_linear_regression import design_matrix
 from gnar.utils.neighbour_sets import neighbour_set_mats, kappa_weight_mat, degree_terms, node_degrees
 from gnar.utils.simulating import gnar1_transition, row_sum_bound, spectral_radius, stationary_cov
@@ -33,6 +35,27 @@ HETERO = with_isolated_node(np.array([[0, 1, 0, 0, 0],
                                       [0, 1, 1, 0, 1],
                                       [0, 0, 0, 1, 0]], dtype=float))
 HETERO_ALPHA = np.array([0.1, 0.3, -0.2, 0.25, 0.15, 0.4])
+
+
+def _same_lsqr_defaults() -> bool:
+    # Whether SciPy's lsqr has the default tolerances the reference was generated with
+    defaults = inspect.signature(lsqr).parameters
+    return {"atol": defaults["atol"].default, "btol": defaults["btol"].default} == _meta["lsqr_defaults"]
+
+
+def legacy_str(G: GNAR) -> str:
+    # GNAR.__str__ of pygnar 8466a80, verbatim: the printed output of a kappa = 1 model must not change
+    model_info = f"{G._model_type.capitalize()} GNAR({G._p}, {G._s}) Model\n"
+    nx_graph = G.to_networkx()
+    graph_info = f"{nx_graph}\n"
+    index = ["mean"] + [f"a_{i}" for i in range(1, G._p + 1)]
+    for i in range(1, G._p + 1):
+        index += [f"b_{i},{j}" for j in range(1, G._s[i - 1] + 1)]
+    parameters = pd.DataFrame(np.vstack([G.mu, G.coeffs]), columns=G._names, index=index)
+    parameter_info = f"Parameters:\n{parameters}\n"
+    cov = pd.DataFrame(cov_mat(G.sigma_2, G._d), index=G._names, columns=G._names)
+    noise = f"Noise covariance matrix:\n{cov}\n"
+    return model_info + graph_info + parameter_info + noise
 
 
 def _observed(G: GNAR, ts_pred: np.ndarray, fitted: bool) -> dict:
@@ -77,14 +100,19 @@ class TestBackwardCompatibility:
             G = build(spec, inputs, **extra)
             observed = _observed(G, inputs["ts_pred"], fitted="ts" in inputs)
         assert set(observed) == set(expected)
+        # The printed output is the legacy one under any pandas version; the frozen string is compared exactly as well
+        # when the pandas version matches the one that generated it (DataFrame formatting can change between versions)
+        assert str(G) == legacy_str(G)
         same_pandas = pd.__version__ == _meta["pandas"]
+        # Where the legacy lsqr stopped before convergence, the frozen values depend on lsqr's default tolerances: they
+        # are compared exactly only under the same defaults, and otherwise within the recorded distance to convergence
+        gap = float(_ref[f"{i}/lsqr_gap"]) if f"{i}/lsqr_gap" in _ref.files else 0.0
+        rtol = 1e-10 if gap < 1e-12 or _same_lsqr_defaults() else 10 * gap
         for key, value in expected.items():
-            if key in ("str", "repr"):
-                if key == "str" and not same_pandas:
-                    continue  # DataFrame formatting can change between pandas versions
+            if key == "repr" or (key == "str" and same_pandas and rtol == 1e-10):
                 assert str(observed[key]) == str(value), key
-            else:
-                np.testing.assert_allclose(observed[key], value, rtol=1e-10, atol=1e-12, err_msg=key)
+            elif key != "str":
+                np.testing.assert_allclose(observed[key], value, rtol=rtol, atol=1e-12, err_msg=key)
 
 
 class TestNesting:
@@ -92,7 +120,9 @@ class TestNesting:
 
     KAPPA_NEAR_1 = float(np.nextafter(1.0, 2.0))
 
-    @pytest.mark.parametrize("A", [path_graph(4), star_graph(5), HETERO, random_tree(12, seed=3)], ids=["path4", "star5", "hetero", "tree12"])
+    # Degrees 6 and 10 matter: exp(-log N) and 1 / N first differ in floating point at N = 6
+    @pytest.mark.parametrize("A", [path_graph(4), star_graph(5), star_graph(6), star_graph(10), HETERO, random_tree(12, seed=3)],
+                             ids=["path4", "star5", "star6", "star10", "hetero", "tree12"])
     def test_weights_continuous_at_one(self, A):
         legacy = neighbour_set_mats(A, 1)
         np.testing.assert_allclose(kappa_weight_mat(A, self.KAPPA_NEAR_1), legacy[0], rtol=1e-14, atol=0)
@@ -161,11 +191,12 @@ class TestDesignMatrix:
         np.testing.assert_array_equal(X, expected)
         np.testing.assert_array_equal(y, np.concatenate([x[1:, i] for i in range(4)]))
 
-    def test_matches_legacy_design_at_kappa_1(self):
+    @pytest.mark.parametrize("A", [HETERO, with_isolated_node(star_graph(6))], ids=["hetero", "star6"])
+    def test_matches_legacy_design_at_kappa_1(self, A):
         # At kappa = 1 the design is the one gnar_lr builds for the standard GNAR(1, [1]) model
         from gnar.utils.gnar_linear_regression import format_X_y
         from gnar.utils.neighbour_sets import compute_neighbour_sums
-        A, ts = HETERO, np.random.default_rng(0).standard_normal((30, 6))
+        ts = np.random.default_rng(0).standard_normal((30, A.shape[0]))
         Xn, yn = format_X_y(compute_neighbour_sums(ts, neighbour_set_mats(A, 1), 1), 1, np.array([1]))
         n, d = Xn.shape[0], Xn.shape[1]
         legacy = np.zeros([n * d, d])
@@ -440,3 +471,203 @@ class TestKappaValidation:
     def test_estimated_kappa_needs_data(self):
         with pytest.raises(ValueError, match="kappa=None"):
             GNAR(self.A, p=1, s=np.array([1]), coeffs=self.COEFFS, kappa=None)
+
+
+class TestStationarityEdgeCases:
+    """Acceptance test 11 on the harder cases: both starting modes, signed parameters, exact unit roots, isolated nodes."""
+
+    UNSTABLE = {
+        # rho = 2.1, spectral radius 0.5 + 0.4 * 2 = 1.3
+        "star": (star_graph(4), 0.5, 0.4, 0.0),
+        # Only the most negative eigenvalue, -0.5 - 0.4 * 2 = -1.3, exceeds 1 in modulus
+        "negative_eigenvalue": (star_graph(4), -0.5, 0.4, 0.0),
+        # A negative alpha on the row that attains rho
+        "negative_alpha": (path_graph(3), np.array([-1.2, 0.1, 0.1]), 0.1, 0.5),
+        # An exact unit root: K_6 is 5-regular, so Phi = alpha I + beta A has the eigenvalue alpha + 5 beta = 1
+        "unit_root_k6": (np.ones((6, 6)) - np.eye(6), 1 - 5 / 64, 1 / 64, 0.0),
+        # A unit root where the computed rho falls just below 1: 6-cycle, alpha + beta 2^(1 - kappa) = 1
+        "unit_root_cycle": (cycle_graph(6), 0.5, 0.5 / 2 ** 0.5, 0.5),
+    }
+
+    @pytest.mark.parametrize("start", ["stationary", "zero"])
+    @pytest.mark.parametrize("case", list(UNSTABLE))
+    def test_simulator_raises(self, case, start):
+        A, alpha, beta, kappa = self.UNSTABLE[case]
+        with pytest.raises(ValueError, match="not stationary"):
+            simulate_gnar1(A, alpha, beta, kappa, n=20, start=start, burn_in=3, rng=0)
+
+    def test_message_reports_values(self):
+        with pytest.raises(ValueError) as err:
+            simulate_gnar1(star_graph(4), 0.5, 0.4, 0.0, n=10, start="zero", rng=0)
+        assert "1.3" in str(err.value) and "2.1" in str(err.value)
+
+    def test_signed_parameters(self):
+        with pytest.raises(ValueError, match="below 1"):
+            stationary_params(path_graph(3), 0.5, 0.4, np.array([0.1, -0.7, 0.1]))
+        with pytest.raises(ValueError, match="below 1"):
+            stationary_params(path_graph(3), 0.5, -0.4, np.array([0.1, 0.7, 0.1]))
+        # rho uses |alpha_i|: the negative alpha attains it here
+        assert row_sum_bound(path_graph(3), np.array([-1.2, 0.1, 0.1]), 0.1, 0.5) == pytest.approx(1.3, rel=1e-14)
+
+    def test_isolated_nodes_have_no_network_term(self):
+        # The isolated node attains rho with its own |alpha|
+        A = with_isolated_node(path_graph(3))
+        assert row_sum_bound(A, np.array([0.1, 0.1, 0.1, 0.9]), 0.2, 0.5) == pytest.approx(0.9, rel=1e-14)
+        # The maximum of N_i^(1 - kappa) runs over nodes with N_i >= 1 only (minimum positive degree 2, kappa > 1)
+        B = with_isolated_node(cycle_plus_chord(9))
+        assert stationary_params(B, 1.2, 0.4, 0.2) == pytest.approx(0.4 / 2 ** -0.2, rel=1e-12)
+
+    def test_stationary_cov_near_minus_one(self):
+        # Gamma0(Phi) = Gamma0(-Phi); with an eigenvalue of -Phi 1e-9 from -1 the Lyapunov solution must stay accurate
+        # (Gamma0 >= sigma^2 I) and the stationary start must work
+        A, lam = star_graph(12), 12 ** 0.25
+        beta = (0.9 - 1e-9) / lam
+        plus = stationary_cov(A, 0.1, beta, 0.5)
+        minus = stationary_cov(A, -0.1, -beta, 0.5)
+        assert np.linalg.eigvalsh(minus).min() >= 1 - 1e-6
+        np.testing.assert_allclose(minus, plus, rtol=1e-6)
+        assert np.all(np.isfinite(simulate_gnar1(A, -0.1, -beta, 0.5, n=5, rng=0)))
+
+    def test_stationary_cov_matches_direct_solver(self):
+        from scipy.linalg import solve_discrete_lyapunov
+        rng = np.random.default_rng(3)
+        for A in [HETERO, random_tree(9, seed=2), star_graph(7)]:
+            alpha = rng.uniform(-0.4, 0.4, A.shape[0])
+            beta = stationary_params(A, 0.7, -0.4, alpha)
+            Phi = gnar1_transition(A, alpha, beta, 0.7).toarray()
+            direct = solve_discrete_lyapunov(Phi, 1.5 * np.eye(A.shape[0]), method="direct")
+            np.testing.assert_allclose(stationary_cov(A, alpha, beta, 0.7, sigma_2=1.5), direct, rtol=1e-10, atol=1e-12)
+
+
+class TestInputValidation:
+
+    @pytest.mark.parametrize("alpha, beta", [(np.nan, 0.1), (0.1, np.inf), (np.array([0.1, np.nan, 0.1]), 0.1)])
+    def test_non_finite_parameters(self, alpha, beta):
+        with pytest.raises(ValueError, match="finite"):
+            simulate_gnar1(path_graph(3), alpha, beta, 0.5, n=5, rng=0)
+
+    def test_alpha_length(self):
+        with pytest.raises(ValueError, match="length"):
+            simulate_gnar1(path_graph(3), np.array([0.1, 0.2]), 0.1, 0.5, n=5, rng=0)
+
+    @pytest.mark.parametrize("sigma_2", [0.0, -1.0, np.nan, np.inf])
+    def test_sigma_2(self, sigma_2):
+        with pytest.raises(ValueError, match="sigma_2"):
+            simulate_gnar1(path_graph(3), 0.1, 0.1, 0.5, n=5, sigma_2=sigma_2, start="zero", rng=0)
+        with pytest.raises(ValueError, match="sigma_2"):
+            stationary_cov(path_graph(3), 0.1, 0.1, 0.5, sigma_2=sigma_2)
+
+    def test_stationary_params_non_finite(self):
+        with pytest.raises(ValueError, match="finite"):
+            stationary_params(path_graph(3), 0.5, np.nan, 0.1)
+        with pytest.raises(ValueError, match="finite"):
+            stationary_params(path_graph(3), 0.5, 0.4, np.array([0.1, np.nan, 0.2]))
+
+    def test_invalid_adjacency_entries(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            check_kappa_graph(-path_graph(3))
+        A = path_graph(3)
+        A[0, 1] = A[1, 0] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            check_kappa_graph(A)
+
+    def test_caller_matrix_not_modified(self):
+        # An int CSR matrix that stores explicit zeros (a removed edge) is a valid undirected graph and must be left intact
+        import networkx as nx
+        A = csr_matrix(nx.to_scipy_sparse_array(nx.cycle_graph(6), dtype=int))
+        A[0, 1] = 0
+        A[1, 0] = 0
+        before = (A.data.copy(), A.indices.copy(), A.indptr.copy())
+        X = simulate_gnar1(A, 0.2, 0.1, 0.5, n=5, rng=0)
+        assert X.shape == (5, 6)
+        for a, b in zip(before, (A.data, A.indices, A.indptr)):
+            np.testing.assert_array_equal(a, b)
+
+    def test_design_matrix_validates(self):
+        ts = np.random.default_rng(0).standard_normal((5, 3))
+        with pytest.raises(NotImplementedError, match="Weighted"):
+            design_matrix(ts, 2 * path_graph(3), 0.5)
+        with pytest.raises(ValueError, match="symmetric"):
+            design_matrix(ts, np.triu(path_graph(3)), 0.5)
+        with pytest.raises(ValueError, match="kappa"):
+            design_matrix(ts, path_graph(3), None)
+
+    def test_diagonal_transition_large_graph(self):
+        # With beta = 0 Phi is diagonal: the spectral radius is max |alpha| without an eigen-solve, also above the dense
+        # threshold where a zero off-diagonal part would stall the sparse solver
+        from scipy.sparse import diags
+        d = 2400
+        A = diags([np.ones(d - 1), np.ones(d - 1)], [1, -1], format="csr")
+        assert spectral_radius(A, 0.3, 0.0, 0.5) == pytest.approx(0.3)
+
+
+class TestSimulatorBranches:
+
+    def test_sparse_branch_matches_dense_recursion(self):
+        # Above the dense threshold the simulator multiplies by a sparse Phi^T; an irregular tree makes Phi non-symmetric
+        A = random_tree(601, seed=1)
+        rng = np.random.default_rng(5)
+        alpha = rng.uniform(0.1, 0.4, 601)
+        X = simulate_gnar1(A, alpha, 0.1, 0.6, n=6, start="zero", burn_in=3, rng=7)
+        gen = np.random.default_rng(7)
+        u = gen.standard_normal((8, 601))
+        Phi = gnar1_transition(A, alpha, 0.1, 0.6).toarray()
+        expected = np.zeros((9, 601))
+        for t in range(1, 9):
+            expected[t] = Phi @ expected[t - 1] + u[t - 1]
+        np.testing.assert_allclose(X, expected[3:], rtol=1e-12, atol=1e-14)
+
+    def test_burn_in_with_stationary_start(self):
+        Xb = simulate_gnar1(HETERO, HETERO_ALPHA, 0.2, 0.6, n=10, burn_in=5, rng=1)
+        Xf = simulate_gnar1(HETERO, HETERO_ALPHA, 0.2, 0.6, n=15, rng=1)
+        np.testing.assert_array_equal(Xb, Xf[5:])
+
+
+class TestFixedKappaFits:
+    """GNAR fits at a fixed kappa != 1 use the kappa-weighted neighbour sums."""
+
+    @pytest.mark.parametrize("kappa", [0.0, 0.3, 1.2])
+    def test_ols_matches_lstsq(self, kappa):
+        X = simulate_gnar1(HETERO, HETERO_ALPHA, 0.3, 0.3, n=400, rng=0)
+        G = GNAR(HETERO, p=1, s=np.array([1]), ts=X, kappa=kappa, demean=False)
+        D, y = design_matrix(X, HETERO, kappa)
+        coef = np.linalg.lstsq(D, y, rcond=None)[0]
+        # Legacy pygnar's lsqr stops at a relative tolerance of 1e-6, hence rtol 1e-4 rather than machine precision
+        np.testing.assert_allclose(np.append(G.coeffs[0], G.coeffs[1, 0]), coef, rtol=1e-4, atol=1e-6)
+
+    def test_yule_walker_uses_kappa(self):
+        X = simulate_gnar1(HETERO, HETERO_ALPHA, 0.3, 0.3, n=20000, rng=1)
+        yw = GNAR(HETERO, p=1, s=np.array([1]), ts=X, kappa=0.3, method="YW", demean=False)
+        ols = GNAR(HETERO, p=1, s=np.array([1]), ts=X, kappa=0.3, demean=False)
+        np.testing.assert_allclose(yw.coeffs, ols.coeffs, atol=0.01)
+        assert yw.coeffs[1, 0] == pytest.approx(0.3, abs=0.05)
+        # At kappa = 1 the network coefficient is on a different scale, so a fit ignoring kappa would stand out
+        yw_1 = GNAR(HETERO, p=1, s=np.array([1]), ts=X, method="YW", demean=False)
+        assert abs(yw_1.coeffs[1, 0] - yw.coeffs[1, 0]) > 0.05
+
+
+class TestKappaAttribute:
+
+    COEFFS = np.array([[0.2, 0.1, 0.3], [0.1, 0.1, 0.1]])
+
+    def test_read_only(self):
+        G = GNAR(path_graph(3), p=1, s=np.array([1]), coeffs=self.COEFFS, kappa=0.5)
+        with pytest.raises(AttributeError):
+            G.kappa = 0.3
+
+    def test_display_near_one(self):
+        kappa = float(np.nextafter(1.0, 2.0))
+        G = GNAR(path_graph(3), p=1, s=np.array([1]), coeffs=self.COEFFS, kappa=kappa)
+        assert f"kappa={kappa!r}" in repr(G) and "kappa=1," not in repr(G)
+        assert f"kappa: {kappa!r} (fixed)" in str(G)
+
+    def test_objects_from_older_versions(self):
+        # Objects pickled by pygnar before kappa existed lack the kappa attributes; they behave as kappa = 1
+        import pickle
+        ts = np.random.default_rng(0).standard_normal((50, 3))
+        G = GNAR(path_graph(3), p=1, s=np.array([1]), ts=ts)
+        expected = (repr(G), str(G), G.bic(), G.aic())
+        del G.__dict__["_kappa"], G.__dict__["_kappa_spec"]
+        old = pickle.loads(pickle.dumps(G))
+        assert (repr(old), str(old), old.bic(), old.aic()) == expected
+        assert old.kappa == 1.0

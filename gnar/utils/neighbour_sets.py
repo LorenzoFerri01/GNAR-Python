@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.sparse import issparse
 
+from gnar.utils.data_utils import check_kappa
+
 def node_degrees(A) -> np.ndarray:
     """
     Compute the number of 1-stage neighbours of each node, N_i = sum_q A[q, i].
@@ -58,7 +60,7 @@ def kappa_weight_mat(A, kappa: float) -> np.ndarray:
     Returns:
         np.array. Weight matrix. Shape (d, d)
     """
-    _, _, w = degree_terms(node_degrees(A), kappa)
+    _, _, w = degree_terms(node_degrees(A), check_kappa(kappa, allow_none=False))
     if issparse(A):
         A = A.toarray()
     return np.asarray(A, dtype=float) * w[None, :]
