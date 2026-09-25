@@ -221,13 +221,23 @@ class TestTransition:
         Phi = gnar1_transition(A, alpha, 0.2, kappa).toarray()
         assert spectral_radius(A, alpha, 0.2, kappa) == pytest.approx(np.max(np.abs(np.linalg.eigvals(Phi))), rel=1e-10)
 
-    def test_spectral_radius_sparse_solver(self):
-        # Above the dense threshold a sparse symmetric eigensolver is used; the cycle's spectrum is known exactly
+    def test_spectral_radius_sparse_solver_regular(self):
+        # Above the dense threshold a sparse symmetric eigensolver is used. On a regular graph the vector of ones is an
+        # eigenvector, which must not stall the solver. Phi = 0.1 I + 0.3 * 2^(-kappa) A, with the eigenvalues of A in [-2, 2]
         from scipy.sparse import diags
         d = 2400
         A = diags([np.ones(d - 1), np.ones(d - 1), [1.0], [1.0]], [1, -1, d - 1, -(d - 1)], format="csr")
-        # Phi = 0.1 I + 0.3 * 2^(-kappa) A with eigenvalues of A in [-2, 2]
         assert spectral_radius(A, 0.1, 0.3, 0.5) == pytest.approx(0.1 + 0.3 * 2 ** -0.5 * 2, rel=1e-8)
+        # With a negative alpha the most negative eigenvalue, -0.1 - 0.3 * 2^(-kappa) * 2, has the largest magnitude
+        assert spectral_radius(A, -0.1, 0.3, 0.5) == pytest.approx(0.1 + 0.3 * 2 ** -0.5 * 2, rel=1e-8)
+
+    def test_spectral_radius_sparse_solver_bipartite(self):
+        # K_{m,n}: D^(-kappa/2) A D^(-kappa/2) has eigenvalues +-(mn)^((1 - kappa)/2) and 0, so with alpha = -0.1 the
+        # spectral radius is 0.1 + beta (mn)^((1 - kappa)/2), attained by the most negative eigenvalue
+        m, n, beta, kappa = 40, 2000, 0.02, 0.5
+        A = csr_matrix(complete_bipartite(m, n))
+        expected = 0.1 + beta * (m * n) ** ((1 - kappa) / 2)
+        assert spectral_radius(A, -0.1, beta, kappa) == pytest.approx(expected, rel=1e-8)
 
 
 class TestStationarity:

@@ -135,10 +135,11 @@ def spectral_radius(A, alpha: float | np.ndarray, beta: float, kappa: float) -> 
     if d <= _DENSE_EIG_MAX:
         eigs = np.linalg.eigvalsh(Phi_sym.toarray())
         return float(np.max(np.abs(eigs)))
-    v0 = np.ones(d)
-    largest = eigsh(Phi_sym, k=1, which="LA", v0=v0, return_eigenvectors=False)
-    smallest = eigsh(Phi_sym, k=1, which="SA", v0=v0, return_eigenvectors=False)
-    return float(max(abs(largest[0]), abs(smallest[0])))
+    # Largest-magnitude eigenvalue by Lanczos. The fixed, generic starting vector keeps the result deterministic; a
+    # structured one such as a vector of ones is an eigenvector of regular graphs and would hide the rest of the spectrum
+    v0 = np.random.default_rng(0).standard_normal(d)
+    largest = eigsh(Phi_sym, k=1, which="LM", v0=v0, ncv=min(d - 1, 50), tol=1e-10, return_eigenvectors=False)
+    return float(abs(largest[0]))
 
 def stationary_cov(A, alpha: float | np.ndarray, beta: float, kappa: float, sigma_2: float = 1.0) -> np.ndarray:
     """
@@ -164,10 +165,13 @@ def stationary_cov(A, alpha: float | np.ndarray, beta: float, kappa: float, sigm
     return (Gamma0 + Gamma0.T) / 2
 
 def _check_stationary(A, alpha: float | np.ndarray, beta: float, kappa: float) -> None:
-    # Raise an error if the spectral radius of Phi is at least 1, reporting both the spectral radius and rho
+    # Raise an error if the spectral radius of Phi is at least 1, reporting both the spectral radius and rho. Since the
+    # spectral radius is at most rho = ||Phi||_inf, rho < 1 settles stationarity without an eigenvalue computation
+    rho = row_sum_bound(A, alpha, beta, kappa)
+    if rho < 1:
+        return
     radius = spectral_radius(A, alpha, beta, kappa)
     if radius >= 1:
-        rho = row_sum_bound(A, alpha, beta, kappa)
         raise ValueError(f"The GNAR model is not stationary: the spectral radius of Phi is {radius:.6g} >= 1 (row-sum bound rho = {rho:.6g}).")
 
 def _random_state(rng):
