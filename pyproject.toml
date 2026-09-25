@@ -26,3 +26,6 @@ dev = ["pytest", "mypy"]
 
 [tool.setuptools.packages.find]
 include = ["gnar*"]
+
+[tool.pytest.ini_options]
+markers = ["slow: slow Monte Carlo tests, skipped unless pytest is run with --runslow"]

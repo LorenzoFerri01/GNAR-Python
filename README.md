@@ -91,6 +91,36 @@ G_distance = GNAR(A_distance, p=2, s=np.array([1, 1]), ts=ts, net_type="distance
 
 ---
 
+## Degree normalisation exponent κ
+
+For GNAR(1, [1]) models on unweighted, undirected graphs, the neighbour sum of node $i$ can be scaled by its degree $N_i$ to the power $-\kappa$:
+
+$$X_{i,t} = \alpha_i X_{i,t-1} + \beta N_i^{-\kappa} \sum_{q \in \mathcal{N}(i)} X_{q,t-1} + \varepsilon_{i,t}.$$
+
+$\kappa = 1$ is the standard GNAR neighbour average and the default, so existing models are unchanged; $\kappa = 0$ means no normalisation. κ can be fixed or estimated by profile likelihood, with standard errors that account for estimating it:
+
+```python
+from gnar import simulate_gnar1, stationary_params, fit_gnar1, plot_profile
+
+# Choose beta so that the most heavily weighted node has network weight 0.4, then simulate from the stationary distribution
+alpha = np.full(A.shape[0], 0.3)
+beta = stationary_params(A, kappa=0.5, b=0.4, alpha=alpha)
+X = simulate_gnar1(A, alpha, beta, kappa=0.5, n=2000, rng=1)
+
+fit = fit_gnar1(A, X, kappa=None, demean=False)   # kappa=None estimates kappa; a number fixes it
+print(fit)                                        # estimates, standard errors, intervals and the test of kappa = 1
+fit.test_kappa(1.0)                               # Wald and likelihood-ratio tests of kappa = 1
+fit.beta_at()                                     # beta at the geometric-mean degree, with its standard error
+plot_profile(fit)                                 # profile deviance with the chi-square cutoff and the Wald approximation
+
+# The same estimate inside a GNAR object, for forecasting and simulation
+G_kappa = GNAR(A, p=1, s=np.array([1]), ts=X, kappa=None, demean=False)
+```
+
+`asymptotic_cov` and `variance_bounds` give the exact asymptotic covariance and degree-based bounds on it from the true parameters and the graph. κ is identified only if the graph has at least two distinct degrees among nodes with neighbours; a warning is raised otherwise. See [examples/kappa_example.ipynb](examples/kappa_example.ipynb) for a worked example.
+
+---
+
 ## 📂 Repository Structure  
 
 The repository is organised as follows:
