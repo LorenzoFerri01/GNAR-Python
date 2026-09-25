@@ -468,10 +468,9 @@ class TestKappaValidation:
         # Directed graphs and self-loops are still accepted with kappa = 1, as before
         GNAR(directed, p=1, s=np.array([1]), coeffs=self.COEFFS)
 
-    def test_estimated_kappa_not_available_yet(self):
-        ts = np.random.default_rng(0).standard_normal((50, 3))
-        with pytest.raises(NotImplementedError, match="kappa=None"):
-            GNAR(self.A, p=1, s=np.array([1]), ts=ts, kappa=None)
+    def test_estimated_kappa_needs_data(self):
+        with pytest.raises(ValueError, match="kappa=None"):
+            GNAR(self.A, p=1, s=np.array([1]), coeffs=self.COEFFS, kappa=None)
 
 
 class TestStationarityEdgeCases:
