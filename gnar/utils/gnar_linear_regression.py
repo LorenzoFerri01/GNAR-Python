@@ -4,6 +4,7 @@ from scipy.sparse.linalg import lsqr
 from scipy.sparse import csr_matrix
 
 from gnar.utils.neighbour_sets import compute_neighbour_sums, kappa_weight_mat
+from gnar.utils.data_utils import check_kappa, check_kappa_graph
 
 def format_X_y(data: np.ndarray, p: int, s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -118,6 +119,8 @@ def design_matrix(ts: np.ndarray, A, kappa: float) -> tuple[np.ndarray, np.ndarr
         X: np.array. Design matrix. Shape (d * (n - 1), d + 1)
         y: np.array. Target vector. Shape (d * (n - 1),)
     """
+    A = check_kappa_graph(A)
+    kappa = check_kappa(kappa, allow_none=False)
     n, d = np.shape(ts)
     # Stage 1 weights A[q, i] N_i^(-kappa), in the same form as the neighbour set matrices
     ns_mats = kappa_weight_mat(A, kappa).reshape(1, d, d)
