@@ -1,7 +1,62 @@
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix, issparse
 
-def gnar_checks(A: np.ndarray, p: int, s: np.ndarray, model_type: str, net_type: str = "unweighted") -> None:
+def check_kappa(kappa: float | int | None, allow_none: bool = True) -> float | None:
+    """
+    Check the normalisation exponent kappa. None means kappa is estimated; otherwise it must be a finite real number.
+
+    Returns:
+        kappa as a float, or None.
+    """
+    if kappa is None:
+        if not allow_none:
+            raise ValueError("kappa must be a number here; kappa=None (estimated) is not allowed.")
+        return None
+    if isinstance(kappa, bool) or not isinstance(kappa, (int, float, np.integer, np.floating)):
+        raise ValueError("kappa must be a real number or None.")
+    kappa = float(kappa)
+    if not np.isfinite(kappa):
+        raise ValueError("kappa must be finite.")
+    return kappa
+
+def check_kappa_graph(A) -> csr_matrix:
+    """
+    Check that A is a valid graph for the kappa-normalised GNAR model: a square, binary, symmetric adjacency matrix
+    with no self-loops (an unweighted, undirected graph). Accepts NumPy arrays and SciPy sparse matrices.
+
+    Raises:
+        NotImplementedError: if A has weights other than 0 and 1 (weighted networks are not supported by the
+            kappa-normalised model).
+        ValueError: if A is not square, has negative or non-finite entries, is not symmetric or has self-loops.
+
+    Returns:
+        A as a new SciPy CSR matrix of floats (the input is never modified).
+    """
+    if issparse(A):
+        A = csr_matrix(A, dtype=float, copy=True)
+    elif isinstance(A, np.ndarray):
+        if A.ndim != 2:
+            raise ValueError("Adjacency matrix A must be a square matrix.")
+        A = csr_matrix(A.astype(float))
+    else:
+        raise ValueError("Adjacency matrix A must be a NumPy array or a SciPy sparse matrix.")
+    if A.shape[0] != A.shape[1]:
+        raise ValueError("Adjacency matrix A must be a square matrix.")
+    A.eliminate_zeros()
+    if not np.all(np.isfinite(A.data)):
+        raise ValueError("Adjacency matrix A must have finite entries.")
+    if np.any(A.data < 0):
+        raise ValueError("Adjacency matrix A must have non-negative weights.")
+    if np.any(A.data != 1):
+        raise NotImplementedError("Weighted networks are not supported by the kappa-normalised GNAR model; A must be binary (0 or 1).")
+    if np.any(A.diagonal() != 0):
+        raise ValueError("The kappa-normalised GNAR model requires a graph without self-loops (zero diagonal in A).")
+    if (A != A.T).nnz != 0:
+        raise ValueError("The kappa-normalised GNAR model requires an undirected graph (A must be symmetric).")
+    return A
+
+def gnar_checks(A: np.ndarray, p: int, s: np.ndarray, model_type: str, net_type: str = "unweighted", kappa: float | None = 1.0) -> None:
     if not isinstance(A, np.ndarray) or A.shape[0] != A.shape[1]:
         raise ValueError("Adjacency matrix A must be a square NumPy array.")
     if np.any(A < 0):
@@ -20,6 +75,18 @@ def gnar_checks(A: np.ndarray, p: int, s: np.ndarray, model_type: str, net_type:
     valid_model_types = {"global", "standard", "local"}
     if model_type not in valid_model_types:
         raise ValueError(f"Invalid model_type. Expected one of {valid_model_types}, got '{model_type}'.")
+    kappa = check_kappa(kappa)
+    if kappa is None or kappa != 1.0:
+        # The kappa-normalised model is only defined for GNAR(1, [1]) on unweighted, undirected graphs
+        if p != 1 or len(s) != 1 or s[0] != 1:
+            raise NotImplementedError("kappa != 1 is only implemented for GNAR(1, [1]) models (p = 1, s = [1]).")
+        if net_type != "unweighted":
+            raise NotImplementedError("kappa != 1 is only implemented for unweighted networks.")
+        if model_type == "local":
+            raise NotImplementedError("kappa != 1 is not supported for local models: node-specific betas absorb N_i^(-kappa), so kappa is not identified.")
+        if kappa is None and model_type == "global":
+            raise NotImplementedError("Estimating kappa is only implemented for standard models (node-specific alpha).")
+        check_kappa_graph(A)
     return None
 
 def set_mean(mean: float | int | np.ndarray | pd.DataFrame, d: int) -> np.ndarray:

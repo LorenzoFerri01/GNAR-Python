@@ -3,6 +3,9 @@ from scipy.linalg import lstsq
 from scipy.sparse.linalg import lsqr
 from scipy.sparse import csr_matrix
 
+from gnar.utils.neighbour_sets import compute_neighbour_sums, kappa_weight_mat
+from gnar.utils.data_utils import check_kappa, check_kappa_graph
+
 def format_X_y(data: np.ndarray, p: int, s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Format the data to fit the GNAR model
@@ -95,3 +98,37 @@ def gnar_lr(data: np.ndarray, p: int, s: np.ndarray, model_type: str) -> tuple[n
     sigma_2 = res.T @ res / (n - p)
 
     return coeffs_mat, sigma_2
+
+
+def design_matrix(ts: np.ndarray, A, kappa: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Stacked design matrix and target of the kappa-normalised GNAR(1, [1]) standard model
+
+        X_{i,t} = alpha_i X_{i,t-1} + beta N_i^(-kappa) S_{i,t-1} + u_{i,t},    S_{i,t-1} = sum_{q in N(i)} X_{q,t-1}.
+
+    Rows are node-major, as in gnar_lr: rows i * (n - 1) to (i + 1) * (n - 1) hold node i at times t = 2, ..., n. Column j < d
+    is the regressor of alpha_j, X_{i,t-1} 1{j = i}, and the last column is the regressor of beta, N_i^(-kappa) S_{i,t-1}
+    (0 for isolated nodes).
+
+    Params:
+        ts: np.array. Time series, time x nodes. Shape (n, d)
+        A: np.array or scipy.sparse matrix. Binary adjacency matrix. Shape (d, d)
+        kappa: float. Normalisation exponent.
+
+    Returns:
+        X: np.array. Design matrix. Shape (d * (n - 1), d + 1)
+        y: np.array. Target vector. Shape (d * (n - 1),)
+    """
+    A = check_kappa_graph(A)
+    kappa = check_kappa(kappa, allow_none=False)
+    n, d = np.shape(ts)
+    # Stage 1 weights A[q, i] N_i^(-kappa), in the same form as the neighbour set matrices
+    ns_mats = kappa_weight_mat(A, kappa).reshape(1, d, d)
+    data = compute_neighbour_sums(np.asarray(ts, dtype=float), ns_mats, 1)
+    X_nodes, y_nodes = format_X_y(data, 1, np.array([1]))
+    m = n - 1
+    X = np.zeros([m * d, d + 1])
+    for i in range(d):
+        X[i * m : (i + 1) * m, i] = X_nodes[:, i, 0]
+    X[:, d] = X_nodes[:, :, 1].T.reshape(-1)
+    return X, y_nodes.T.reshape(-1)

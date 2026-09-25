@@ -1,6 +1,71 @@
 import numpy as np
+from scipy.sparse import issparse
 
-def neighbour_set_mats(A: np.ndarray, r: int, net_type: str = "unweighted") -> np.ndarray:
+from gnar.utils.data_utils import check_kappa
+
+def node_degrees(A) -> np.ndarray:
+    """
+    Compute the number of 1-stage neighbours of each node, N_i = sum_q A[q, i].
+
+    These are the column sums of A, matching the normalisation in neighbour_set_mats. For an undirected graph they are the node degrees.
+
+    Params:
+        A: np.array or scipy.sparse matrix. Binary adjacency matrix. Shape (d, d)
+
+    Returns:
+        np.array. Degrees N_i as floats. Shape (d,)
+    """
+    return np.asarray(A.sum(axis=0), dtype=float).ravel()
+
+def degree_terms(degrees: np.ndarray, kappa: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the degree quantities used by the kappa-normalised GNAR model.
+
+    The normalisation is N_i^(-kappa) = exp(-kappa log N_i) for nodes with N_i >= 1. Isolated nodes (N_i = 0) get weight 0,
+    so their network term vanishes, and log N_i is set to 0 for them without ever being evaluated. For kappa == 1 the
+    weight is computed as 1 / N_i, the same arithmetic as the standard GNAR neighbour average, so that kappa = 1 reproduces
+    the existing weights exactly.
+
+    Params:
+        degrees: np.array. Degrees N_i. Shape (d,)
+        kappa: float. Normalisation exponent.
+
+    Returns:
+        mask: np.array of bool. True for nodes with N_i >= 1. Shape (d,)
+        log_N: np.array. log N_i, with 0 for isolated nodes. Shape (d,)
+        w: np.array. N_i^(-kappa), with 0 for isolated nodes. Shape (d,)
+    """
+    degrees = np.asarray(degrees, dtype=float)
+    mask = degrees > 0
+    log_N = np.zeros_like(degrees)
+    np.log(degrees, out=log_N, where=mask)
+    w = np.zeros_like(degrees)
+    if kappa == 1.0:
+        np.divide(1.0, degrees, out=w, where=mask)
+    else:
+        w[mask] = np.exp(-kappa * log_N[mask])
+    return mask, log_N, w
+
+def kappa_weight_mat(A, kappa: float) -> np.ndarray:
+    """
+    Compute the kappa-normalised stage 1 weight matrix W[q, i] = A[q, i] N_i^(-kappa).
+
+    With this matrix the network term of node i is sum_q X_q W[q, i] = N_i^(-kappa) S_i, where S_i is the sum over the
+    neighbours of node i.
+
+    Params:
+        A: np.array or scipy.sparse matrix. Binary adjacency matrix. Shape (d, d)
+        kappa: float. Normalisation exponent.
+
+    Returns:
+        np.array. Weight matrix. Shape (d, d)
+    """
+    _, _, w = degree_terms(node_degrees(A), check_kappa(kappa, allow_none=False))
+    if issparse(A):
+        A = A.toarray()
+    return np.asarray(A, dtype=float) * w[None, :]
+
+def neighbour_set_mats(A: np.ndarray, r: int, net_type: str = "unweighted", kappa: float = 1.0) -> np.ndarray:
     """
     Compute a tensor containing the neighbour weight matrices up to stage r.
 
@@ -10,17 +75,29 @@ def neighbour_set_mats(A: np.ndarray, r: int, net_type: str = "unweighted") -> n
       - "weighted": weights proportional to connection strengths (products along paths)
       - "distance": weights inversely proportional to distances (products of 1/dist along paths)
 
+    With kappa != 1 (unweighted networks and r = 1 only), the stage 1 weights are A[q, i] N_i^(-kappa) instead of
+    A[q, i] / N_i, see kappa_weight_mat.
+
     Params:
         A: np.array. Adjacency matrix. Shape (n, n). For unweighted networks, entries
             must be 0 or 1. For weighted/distance networks, entries are non-negative.
         r: int. Maximum stage of neighbour dependence.
         net_type: str. One of "unweighted", "weighted", or "distance".
+        kappa: float. Degree normalisation exponent. Defaults to 1, the standard GNAR neighbour average.
 
     Returns:
         ns_mats: np.array. Tensor of neighbour weight matrices. Shape (r, n, n)
     """
     d = A.shape[0]
     ns_mats = np.zeros([r, d, d])
+
+    if kappa != 1.0:
+        if net_type != "unweighted":
+            raise NotImplementedError("kappa != 1 is only implemented for unweighted networks.")
+        if r != 1:
+            raise NotImplementedError("kappa != 1 is only implemented for stage 1 neighbours (r = 1).")
+        ns_mats[0] = kappa_weight_mat(A, kappa)
+        return ns_mats
 
     if net_type == "unweighted":
         # Stage 1
