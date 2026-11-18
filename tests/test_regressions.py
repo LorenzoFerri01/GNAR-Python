@@ -196,3 +196,34 @@ class TestStandardOLSPrecision:
         exact = np.linalg.lstsq(D, y.T.reshape(-1), rcond=None)[0]
         np.testing.assert_allclose(G.coeffs[p:, 0], exact[p * d:], atol=1e-9)
         np.testing.assert_allclose(G.coeffs[:p].T.reshape(-1), exact[:p * d].reshape(p, d).T.reshape(-1), atol=1e-9)
+
+
+class TestAutocovLyapunov:
+
+    @staticmethod
+    def _kron_reference(V):
+        # Previous implementation: vec(Gamma) = (I - Phi (x) Phi)^{-1} vec(Sigma)
+        phi, sigma_2 = V.companion_form()
+        k = phi.shape[0]
+        G = (np.linalg.inv(np.eye(k ** 2) - np.kron(phi, phi)) @ sigma_2.flatten()).reshape(k, k)
+        return G[:V._d].T.reshape(V._p, V._d, V._d).transpose(0, 2, 1)
+
+    @pytest.mark.parametrize("p", [1, 2, 3])
+    def test_matches_kronecker_formula(self, p):
+        rng = np.random.default_rng(p)
+        d = 4
+        coeffs = rng.normal(0, 0.15, (p * d, d))
+        L = rng.normal(size=(d, d))
+        V = VAR(p=p, coeffs=coeffs, sigma_2=L @ L.T + np.eye(d))
+        assert V.is_stationary()
+        np.testing.assert_allclose(V.compute_autocov_mats(p - 1), self._kron_reference(V), atol=1e-10)
+
+    def test_large_var(self):
+        # The Kronecker approach would need a (d^2 x d^2) matrix: 40000 x 40000 here
+        d = 200
+        rng = np.random.default_rng(0)
+        V = VAR(p=1, coeffs=rng.normal(0, 0.3 / np.sqrt(d), (d, d)), sigma_2=1.0)
+        G = V.compute_autocov_mats(2)
+        phi = V.coeffs.T
+        np.testing.assert_allclose(G[0], phi @ G[0] @ phi.T + np.eye(d), atol=1e-8)
+        np.testing.assert_allclose(G[1], phi @ G[0], atol=1e-10)

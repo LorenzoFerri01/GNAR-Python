@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import warnings
+from scipy.linalg import solve_discrete_lyapunov
 
 from gnar.utils.simulating import generate_noise
 from gnar.utils.data_utils import *
@@ -245,9 +246,10 @@ class VAR:
         if max_lag is None:
             max_lag = self._p
         phi, sigma_2 = self.companion_form()
-        d = self._d * self._p
-        # Autocovariance matrices are stacked horizontally in the order Gamma(0), ..., Gamma(p-1)
-        autocovs = (np.linalg.inv(np.eye(d ** 2) - np.kron(phi, phi)) @ sigma_2.flatten()).reshape(d, d)[:self._d]
+        # The covariance of the companion-form state solves the discrete Lyapunov equation Gamma = Phi Gamma Phi^T + Sigma.
+        # Solving it directly costs O((dp)^3), instead of inverting the (dp)^2 x (dp)^2 matrix I - Phi (x) Phi.
+        # Its first d rows stack the autocovariance matrices horizontally in the order Gamma(0), ..., Gamma(p-1)
+        autocovs = solve_discrete_lyapunov(phi, sigma_2)[:self._d]
         # Format the first p autocovariance matrices. Shape: (p, d, d). Order: Gamma_0, ..., Gamma_{p-1}
         autocovs =  autocovs.T.reshape(self._p, self._d, self._d).transpose(0, 2, 1)
         # Format the coefficients to compute the remaining autocovariance matrices. Shape: (p, d, d). Order: Phi_p, ..., Phi_1
