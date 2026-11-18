@@ -91,6 +91,8 @@ class KappaGNAR:
         beta (float): Unnormalised network coefficient, beta = b / rho_kappa. Alternative to b.
         mean (float, int, np.ndarray or pd.DataFrame): The mean of the process. Defaults to 0.
         sigma_2 (float): Noise variance, common to all nodes. Defaults to 1.
+        names (list-like): Node names, in the order of the rows of A. Defaults to 0, ..., d - 1 (matching the node labels of
+            networkx.from_numpy_array). Used in printing, in to_var(), and in DataFrame outputs.
 
     Methods:
         phi: VAR(1) coefficient matrix.
@@ -112,6 +114,7 @@ class KappaGNAR:
         beta: float | None = None,
         mean: float | int | np.ndarray | pd.DataFrame = 0,
         sigma_2: float = 1.0,
+        names=None,
     ) -> None:
         check_kappa_adjacency(A)
         if not np.isscalar(kappa) or not 0 <= kappa <= 1:
@@ -124,6 +127,11 @@ class KappaGNAR:
         self._A = A.astype(float)
         self._d = A.shape[0]
         self._degrees = self._A.sum(axis=1)
+        self._names = pd.RangeIndex(self._d) if names is None else pd.Index(names)
+        if len(self._names) != self._d:
+            raise ValueError(f"The number of names ({len(self._names)}) does not match the number of nodes ({self._d}).")
+        if not self._names.is_unique:
+            raise ValueError("Node names must be unique.")
 
         self.alpha = float(alpha)
         self.kappa = float(kappa)
@@ -142,9 +150,14 @@ class KappaGNAR:
         return self.b / self.rho
 
     @property
-    def degrees(self) -> np.ndarray:
-        """Node degrees."""
-        return self._degrees.copy()
+    def degrees(self) -> pd.Series:
+        """Node degrees, indexed by node name."""
+        return pd.Series(self._degrees, index=self._names, name="degree")
+
+    @property
+    def names(self) -> pd.Index:
+        """Node names."""
+        return self._names
 
     def is_regular(self) -> bool:
         """True if all nodes have the same degree, in which case kappa is not identifiable from data."""
@@ -176,9 +189,10 @@ class KappaGNAR:
             # Stationarity is already checked (and warned about) by this class
             warnings.simplefilter("ignore", UserWarning)
             # VAR stores coefficients as (source, target), i.e. the transpose of Phi
-            return VAR(p=1, coeffs=self.phi().T, mean=self.mu, sigma_2=self.sigma_2)
+            return VAR(p=1, coeffs=pd.DataFrame(self.phi().T, columns=self._names), mean=self.mu, sigma_2=self.sigma_2)
 
-    def simulate(self, n: int, sigma_2: float | None = None, burn_in: int = 50) -> np.ndarray:
+    def simulate(self, n: int, sigma_2: float | None = None, burn_in: int = 50,
+                 as_frame: bool = False) -> np.ndarray | pd.DataFrame:
         """
         Simulate a realisation from the model.
 
@@ -186,11 +200,13 @@ class KappaGNAR:
             n (int): The number of time steps to simulate.
             sigma_2 (float): The noise variance. Defaults to the model's sigma_2.
             burn_in (int): The number of burn-in steps to discard.
+            as_frame (bool): If True, return a DataFrame with the node names as columns. Defaults to False.
 
         Returns:
-            np.ndarray: The simulated time series. Shape (n, d).
+            np.ndarray or pd.DataFrame: The simulated time series. Shape (n, d).
         """
-        return self.to_var().simulate(n, sigma_2=self.sigma_2 if sigma_2 is None else sigma_2, burn_in=burn_in)
+        sim = self.to_var().simulate(n, sigma_2=self.sigma_2 if sigma_2 is None else sigma_2, burn_in=burn_in)
+        return pd.DataFrame(sim, columns=self._names) if as_frame else sim
 
     def predict(self, ts: np.ndarray | pd.DataFrame, h: int = 1) -> np.ndarray | pd.DataFrame:
         """
@@ -215,7 +231,7 @@ class KappaGNAR:
     def __str__(self) -> str:
         params = pd.Series({"alpha": self.alpha, "b": self.b, "kappa": self.kappa,
                             "beta (= b / rho_kappa)": self.beta, "rho_kappa": self.rho, "sigma_2": self.sigma_2})
-        mean = pd.DataFrame(self.mu, index=["mean"], columns=np.arange(1, self._d + 1))
+        mean = pd.DataFrame(self.mu, index=["mean"], columns=self._names)
         return (f"Kappa-GNAR(1, [1]) Model (spectral normalisation)\n"
                 f"Graph with {self._d} nodes and {int(self._A.sum() / 2)} edges\n"
                 f"Parameters:\n{params.to_string()}\n{mean}\n")

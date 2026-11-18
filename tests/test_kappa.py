@@ -255,3 +255,34 @@ class TestVARFunctionality:
         assert "KappaGNAR" in repr(self.K)
         s = str(self.K)
         assert "rho_kappa" in s and "6 nodes and 6 edges" in s
+
+
+class TestNames:
+
+    def test_default_names(self):
+        K = KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5)
+        assert list(K.names) == list(range(6))
+        assert list(K.degrees.index) == list(range(6))
+
+    def test_custom_names(self):
+        names = list("abcdef")
+        K = KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, names=names)
+        assert list(K.names) == names
+        assert K.degrees["a"] == 4
+        assert list(K.to_var()._names) == names
+        assert "a" in str(K)
+
+    def test_simulate_as_frame(self):
+        K = KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, names=list("abcdef"))
+        np.random.seed(0)
+        df = K.simulate(20, as_frame=True)
+        np.random.seed(0)
+        arr = K.simulate(20)
+        assert isinstance(df, pd.DataFrame) and list(df.columns) == list("abcdef")
+        np.testing.assert_array_equal(df.to_numpy(), arr)
+
+    def test_invalid_names(self):
+        with pytest.raises(ValueError, match="number of names"):
+            KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, names=list("abc"))
+        with pytest.raises(ValueError, match="unique"):
+            KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, names=list("aabcde"))
