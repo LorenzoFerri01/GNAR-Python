@@ -231,7 +231,15 @@ class KappaGNAR:
     def __str__(self) -> str:
         params = pd.Series({"alpha": self.alpha, "b": self.b, "kappa": self.kappa,
                             "beta (= b / rho_kappa)": self.beta, "rho_kappa": self.rho, "sigma_2": self.sigma_2})
-        mean = pd.DataFrame(self.mu, index=["mean"], columns=self._names)
+        mu = self.mu.ravel()
+        if np.all(mu == mu[0]):
+            mean = f"Mean: {mu[0]:g} (all nodes)"
+        elif self._d <= 10:
+            mean = f"Mean:\n{pd.DataFrame(self.mu, index=['mean'], columns=self._names)}"
+        else:
+            mean = f"Mean: varies by node, from {mu.min():.4g} to {mu.max():.4g} (see .mu)"
+        deg = self._degrees
         return (f"Kappa-GNAR(1, [1]) Model (spectral normalisation)\n"
-                f"Graph with {self._d} nodes and {int(self._A.sum() / 2)} edges\n"
+                f"Graph with {self._d} nodes and {int(self._A.sum() / 2)} edges; "
+                f"degrees from {deg.min():.0f} to {deg.max():.0f} (mean {deg.mean():.2f})\n"
                 f"Parameters:\n{params.to_string()}\n{mean}\n")

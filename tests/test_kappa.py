@@ -286,3 +286,22 @@ class TestNames:
             KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, names=list("abc"))
         with pytest.raises(ValueError, match="unique"):
             KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, names=list("aabcde"))
+
+
+class TestPrintout:
+
+    def test_constant_mean(self):
+        assert "Mean: 0 (all nodes)" in str(KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5))
+
+    def test_small_graph_varying_mean_shows_all(self):
+        s = str(KappaGNAR(A_IRREG, alpha=0.3, b=0.4, kappa=0.5, mean=np.arange(6.0), names=list("abcdef")))
+        assert "f" in s and "5.0" in s
+
+    def test_large_graph_varying_mean_is_compact(self):
+        A = np.zeros((30, 30))
+        for i in range(30):
+            A[i, (i + 1) % 30] = A[(i + 1) % 30, i] = 1
+        A[0, 15] = A[15, 0] = 1
+        s = str(KappaGNAR(A, alpha=0.3, b=0.4, kappa=0.5, mean=np.arange(30.0)))
+        assert "varies by node, from 0 to 29" in s
+        assert len(s.splitlines()) < 15
