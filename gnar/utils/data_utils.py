@@ -11,10 +11,12 @@ def gnar_checks(A: np.ndarray, p: int, s: np.ndarray, model_type: str, net_type:
         raise ValueError(f"Invalid net_type. Expected one of {valid_net_types}, got '{net_type}'.")
     if net_type == "unweighted" and not np.all((A == 0) | (A == 1)):
         raise ValueError("Adjacency matrix A must be binary (0 or 1) for unweighted networks.")
-    if p < 1:
-        raise ValueError("The number of lags p must be at least 1.")
-    if not isinstance(s, np.ndarray) or len(s) != p:
-        raise ValueError("Array s must be a NumPy array with length equal to p (number of lags).")
+    if not isinstance(p, (int, np.integer)) or p < 1:
+        raise ValueError("The number of lags p must be an integer of at least 1.")
+    if not isinstance(s, np.ndarray) or s.ndim != 1 or len(s) != p:
+        raise ValueError("Array s must be a 1-D NumPy array with length equal to p (number of lags).")
+    if not np.issubdtype(s.dtype, np.number) or np.any(s != np.round(s)):
+        raise ValueError("Values in s must be non-negative integers.")
     if np.any(s < 0):
         raise ValueError("Values in s must be non-negative integers.")
     valid_model_types = {"global", "standard", "local"}
@@ -23,7 +25,7 @@ def gnar_checks(A: np.ndarray, p: int, s: np.ndarray, model_type: str, net_type:
     return None
 
 def set_mean(mean: float | int | np.ndarray | pd.DataFrame, d: int) -> np.ndarray:
-    if isinstance(mean, (float, int)):
+    if isinstance(mean, (float, int, np.number)):
         return np.full((1, d), mean)
     elif isinstance(mean, np.ndarray):
         return mean.reshape(1, d)
@@ -33,7 +35,10 @@ def set_mean(mean: float | int | np.ndarray | pd.DataFrame, d: int) -> np.ndarra
         raise ValueError("Mean must be a float, int, NumPy array or Pandas DataFrame.")
 
 def set_cov(sigma_2: float | int | np.ndarray | pd.DataFrame) -> float | int | np.ndarray:
-    if isinstance(sigma_2, (float, int, np.ndarray)):
+    if np.ndim(sigma_2) == 0 and isinstance(sigma_2, (int, float, np.number, np.ndarray)):
+        # Python or NumPy scalar (including 0-d arrays)
+        return float(sigma_2)
+    if isinstance(sigma_2, np.ndarray):
         return sigma_2
     elif isinstance(sigma_2, pd.DataFrame):
         return sigma_2.to_numpy()
@@ -41,8 +46,8 @@ def set_cov(sigma_2: float | int | np.ndarray | pd.DataFrame) -> float | int | n
         raise ValueError("Noise covariance matrix must be a float, int, NumPy array or Pandas DataFrame.")
 
 def cov_mat(sigma_2: float | int | np.ndarray, d: int) -> np.ndarray:
-    if isinstance(sigma_2, (int, float)):
-        return sigma_2 * np.eye(d)
+    if np.ndim(sigma_2) == 0:
+        return float(sigma_2) * np.eye(d)
     elif isinstance(sigma_2, np.ndarray) and (sigma_2.ndim == 1 or sigma_2.shape[0] == 1):
         return np.diag(sigma_2.flatten())
     return sigma_2

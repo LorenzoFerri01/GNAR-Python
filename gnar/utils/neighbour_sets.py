@@ -21,6 +21,9 @@ def neighbour_set_mats(A: np.ndarray, r: int, net_type: str = "unweighted") -> n
     """
     d = A.shape[0]
     ns_mats = np.zeros([r, d, d])
+    if r == 0:
+        # No neighbour dependence (e.g. s = [0, ..., 0]): nothing to compute
+        return ns_mats
 
     if net_type == "unweighted":
         # Stage 1

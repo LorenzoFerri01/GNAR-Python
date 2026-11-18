@@ -162,7 +162,7 @@ def format_standard(Gamma_G: np.ndarray, gamma_G: np.ndarray, d: int, p: int, s:
         s_j_X = 0
         for j in range(1, p + 1):
             Gamma_G_tau_j = Gamma_G[:, s_tau : s_tau + 1 + s[tau - 1], s_j : s_j + 1 + s[j - 1]]
-            X_tau_j = np.zeros([d + s[tau - 1], d + s[tau - 1]])
+            X_tau_j = np.zeros([d + s[tau - 1], d + s[j - 1]])
             # The alpha coefficients are unconstrained across nodes, so the corresponding data is placed diagonally in the matrix
             X_tau_j[:d, :d] = np.diag(Gamma_G_tau_j[:, 0, 0])
             # The betas are constrained to be the same, so the corresponding data is placed in the remaining columns/rows and in some cases summed

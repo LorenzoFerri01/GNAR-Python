@@ -37,8 +37,9 @@ def generate_noise(sigma_2: float | int | np.ndarray, n: int, d: int) -> np.ndar
     Returns:
         np.array. Noise matrix. Shape (n, d)
     """
-    if isinstance(sigma_2, (float, int)):
-        return np.random.normal(loc=0, scale=np.sqrt(sigma_2), size=(n, d))
-    elif sigma_2.ndim == 1 or sigma_2.shape[0] == 1:
+    if np.ndim(sigma_2) == 0:
+        return np.random.normal(loc=0, scale=np.sqrt(float(sigma_2)), size=(n, d))
+    sigma_2 = np.asarray(sigma_2)
+    if sigma_2.ndim == 1 or sigma_2.shape[0] == 1:
         return np.random.normal(loc=0, scale=np.sqrt(sigma_2), size=(n, d))
     return np.random.multivariate_normal(mean=np.zeros(d), cov=sigma_2, size=n)

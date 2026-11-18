@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import networkx as nx
+import warnings
 
 from gnar.utils.gnar_linear_regression import gnar_lr
 from gnar.utils.gnar_yule_walker import gnar_yw, estimate_covariance_mats, estimate_res_mat
@@ -25,7 +26,7 @@ class GNAR:
         ts (np.ndarray or pd.DataFrame): The input time series data. Shape (n, d) where n is the number of observations and d is the number of nodes.
         demean (bool): Whether to remove the mean from the data. Only required if ts is provided. Defaults to True.
         method (str): The method used to fit the model. Either "OLS" or "YW". Defaults to "OLS".
-        coeffs (np.ndarray or pd.DataFrame): The parameters of the GNAR model, consisting of the mean and coefficients of each node. Shape (1 + p + sum(s), d).
+        coeffs (np.ndarray or pd.DataFrame): The parameters of the GNAR model, consisting of the alpha coefficients (rows 0..p-1) followed by the beta coefficients grouped by lag. Shape (p + sum(s), d). The mean is passed separately via mean.
         mean (float, int, np.ndarray or pd.DataFrame): The mean of the time series data. If a float, the same mean is used for all nodes. Only required if parameters is provided. Defaults to 0.
         sigma_2 (float, int, np.ndarray or pd.DataFrame): The variance or covariance of the noise. If a float, the noise is assumed to have the same variance and be independent across nodes. Only required if parameters is provided. Defaults to 1.
 
@@ -57,12 +58,13 @@ class GNAR:
         gnar_checks(A, p, s, model_type, net_type)
 
         self._A = A
-        self._p = p
-        self._s = s
+        self._p = int(p)
+        # s has been validated to contain integer values; store it with an integer dtype
+        self._s = s.astype(int)
         self._model_type = model_type
         self._net_type = net_type
         # Compute the neighbour set matrices up to the maximum stage of neighbour dependence
-        self._ns_mats = neighbour_set_mats(A, np.max(s), net_type)
+        self._ns_mats = neighbour_set_mats(A, int(np.max(self._s)), net_type)
 
         if ts is not None:
             # If a time series is provided, fit the model to the data, removing the mean if necessary
@@ -96,6 +98,18 @@ class GNAR:
         # Store the mean of the time series data and the covariance matrix of the noise
         self.mu = set_mean(mean, self._d)
         self.sigma_2 = set_cov(sigma_2)
+        # Check whether the process is stationary
+        if not self.is_stationary():
+            warnings.warn("The GNAR model is non-stationary based on the provided parameters!", UserWarning)
+
+    def is_stationary(self) -> bool:
+        """
+        Check if the GNAR model is stationary, using the companion form of its VAR representation.
+        """
+        with warnings.catch_warnings():
+            # to_var() would emit its own non-stationarity warning
+            warnings.simplefilter("ignore", UserWarning)
+            return self.to_var().is_stationary()
 
     def fit(self, ts: np.ndarray | pd.DataFrame, demean: bool = True, method: str = "OLS") -> None:
         """
@@ -105,7 +119,14 @@ class GNAR:
             ts (np.ndarray or pd.DataFrame): The input time series data. Shape (n, d) where n is the number of observations and d is the number of nodes.
             demean (bool): Whether to remove the mean from the data.
         """
-        self._n, self._d = np.shape(ts)
+        n, d = np.shape(ts)
+        if d != self._A.shape[0]:
+            raise ValueError(f"The time series has {d} columns but the adjacency matrix has {self._A.shape[0]} nodes.")
+        if n <= self._p:
+            raise ValueError("The number of observations must exceed the number of lags p.")
+        if method not in ("OLS", "YW"):
+            raise ValueError("Method must be one of 'OLS' or 'YW'.")
+        self._n, self._d = n, d
         self._ts = ts
         if isinstance(ts, pd.DataFrame):
             self._names = ts.columns
@@ -222,14 +243,16 @@ class GNAR:
         # Generate the noise - depending on the structure of sigma_2, different sampling methods are used. E.g, if sigma_2 is a scalar, the noise is sampled from np.random.normal, which is faster than using np.random.multivariate_normal using a diagonal covariance matrix.
         if sigma_2 is None:
             sigma_2 = self.sigma_2
-        e_t = generate_noise(sigma_2, burn_in + n, d)
+        # The first p rows are the all-zero pre-sample used to start the recursion; they are always discarded
+        total = self._p + burn_in + n
+        e_t = generate_noise(sigma_2, total, d)
 
         # Initialise the array to store the simulated time series data
-        ts_sim = np.zeros([burn_in + n, d])
+        ts_sim = np.zeros([total, d])
         ns = np.zeros([d, self._p * r])
         # Initialise the design matrix, which is an array of shape (d, p + sum(s))
         X = np.zeros([d, self._p + np.sum(self._s)])
-        for t in range(self._p, burn_in + n):
+        for t in range(self._p, total):
             # Compute the simulated observation
             sim = np.sum(X * coeffs, axis=1) + e_t[t]
             ts_sim[t] = sim.copy()
@@ -242,7 +265,7 @@ class GNAR:
             X = shift_X(X, sim, ns, self._p, self._s)
 
         # Return the simulated time series data, adding the mean to the data
-        return ts_sim[burn_in:] + self.mu
+        return ts_sim[self._p + burn_in:] + self.mu
 
     def compute_autocov_mats(self, max_lag: int | None = None) -> np.ndarray:
         """

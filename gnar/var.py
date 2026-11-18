@@ -13,7 +13,8 @@ class VAR:
         p (int): The number of lags.
         ts (np.ndarray or pd.DataFrame): The input time series data. Shape (n, d) where n is the number of observations and d is the number of time series.
         demean (bool): Whether to remove the mean from the data. Only used if ts is provided.
-        parameters (np.ndarray or pd.DataFrame): The parameters of the VAR model, consisting of the means and coefficients. Shape (1 + p * d, d).
+        coeffs (np.ndarray or pd.DataFrame): The coefficients of the VAR model. Shape (p * d, d), where row (j - 1) * d + i is the effect of series i at lag j. The mean is passed separately via mean.
+        mean (float, int, np.ndarray or pd.DataFrame): The mean of the time series. Only used if coeffs is provided.
         sigma_2 (float, int, np.ndarray or pd.DataFrame): The variance or covariance of the noise. If a float, the same variance is used for all time series. Only used if parameters is provided.
 
     Methods:
@@ -82,7 +83,10 @@ class VAR:
             ts (ndarray): The input time series data. Shape (n, d) where n is the number of observations and d is the number of time series.
             demean (bool): Whether to remove the mean from the data.
         """
-        self._n, self._d = n, d = np.shape(ts)
+        n, d = np.shape(ts)
+        if n <= self._p:
+            raise ValueError("The number of observations must exceed the number of lags p.")
+        self._n, self._d = n, d
         self._ts = ts
         if isinstance(ts, pd.DataFrame):
             self._names = ts.columns
@@ -187,12 +191,14 @@ class VAR:
         # Generate the noise - depending on the structure of sigma_2, different sampling methods are used. E.g, if sigma_2 is a scalar, the noise is sampled from np.random.normal, which is faster than using np.random.multivariate_normal using a diagonal covariance matrix.
         if sigma_2 is None:
             sigma_2 = self.sigma_2
-        e_t = generate_noise(sigma_2, burn_in + n, self._d)
+        # The first p rows are the all-zero pre-sample used to start the recursion; they are always discarded
+        total = self._p + burn_in + n
+        e_t = generate_noise(sigma_2, total, self._d)
 
         # Initialise the array to store the simulated time series data
-        ts_sim = np.zeros([burn_in + n, self._d])
+        ts_sim = np.zeros([total, self._d])
         X = np.zeros(self._p * self._d)
-        for t in range(self._p, burn_in + n):
+        for t in range(self._p, total):
             # Compute the simulated observation
             sim = coeffs @ X + e_t[t]
             ts_sim[t] = sim.copy()
@@ -202,7 +208,7 @@ class VAR:
             else:
                 X = np.hstack([sim, X[:-self._d]])
         # Return the simulated time series data, adding the mean to the data
-        return ts_sim[burn_in:] + self.mu
+        return ts_sim[self._p + burn_in:] + self.mu
 
     def is_stationary(self) -> bool:
         """
@@ -249,7 +255,7 @@ class VAR:
         for tau in range(max_lag - self._p + 1):
             # Compute the lag tau autocovariance matrix and stack it to the rest
             autocovs = np.vstack([autocovs, np.sum(coeffs @ autocovs[-self._p:], axis=0).reshape(1, self._d, self._d)])
-        return autocovs
+        return autocovs[:max_lag + 1]
 
     def compute_autocorr_mats(self, max_lag: int | None = None) -> np.ndarray:
         """

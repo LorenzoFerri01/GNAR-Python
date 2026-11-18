@@ -77,7 +77,8 @@ def gnar_lr(data: np.ndarray, p: int, s: np.ndarray, model_type: str) -> tuple[n
         valid_cols = np.any(design_matrix != 0, axis=0)
         # Use a sparse representation for efficient computation
         sparse_design_matrix = csr_matrix(design_matrix[:, valid_cols])
-        coeffs[valid_cols] = lsqr(sparse_design_matrix, target)[0].flatten()
+        coeffs[valid_cols] = lsqr(sparse_design_matrix, target.ravel(), atol=1e-14, btol=1e-14, conlim=1e14,
+                                  iter_lim=20 * sparse_design_matrix.shape[1])[0]
         # Remap the coefficients to the original shape
         coeffs_mat = coeffs[0 : d * p].reshape(p, d).T
         coeffs_mat = np.hstack([coeffs_mat, np.repeat(coeffs[d * p :].reshape(1, -1), d, axis=0)])
@@ -90,8 +91,8 @@ def gnar_lr(data: np.ndarray, p: int, s: np.ndarray, model_type: str) -> tuple[n
             valid_cols = np.any(X_i != 0, axis=0)
             coeffs_mat[i, valid_cols > 0] = lstsq(X_i[:, valid_cols > 0], y[:, i])[0].flatten()
 
-    # Compute the covariance matrix of the residuals
+    # Compute the covariance matrix of the residuals. Note that n is the number of rows of the design matrix, i.e. n_obs - p
     res = np.sum(X * coeffs_mat, axis=2) - y
-    sigma_2 = res.T @ res / (n - p)
+    sigma_2 = res.T @ res / n
 
     return coeffs_mat, sigma_2
