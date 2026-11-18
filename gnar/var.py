@@ -17,6 +17,7 @@ class VAR:
         coeffs (np.ndarray or pd.DataFrame): The coefficients of the VAR model. Shape (p * d, d), where row (j - 1) * d + i is the effect of series i at lag j. The mean is passed separately via mean.
         mean (float, int, np.ndarray or pd.DataFrame): The mean of the time series. Only used if coeffs is provided.
         sigma_2 (float, int, np.ndarray or pd.DataFrame): The variance or covariance of the noise. If a float, the same variance is used for all time series. Only used if parameters is provided.
+        check_stationarity (bool): Whether to check stationarity (and warn if violated) when coeffs is provided. The check computes the eigenvalues of the dense companion matrix, which costs O((pd)^3); disable it when stationarity is already known. Defaults to True.
 
     Methods:
         fit: Fit the VAR model to the time series data.
@@ -33,6 +34,7 @@ class VAR:
         coeffs: np.ndarray | pd.DataFrame | None = None,
         mean: float | int | np.ndarray | pd.DataFrame = 0,
         sigma_2: float | int | np.ndarray | pd.DataFrame = 1,
+        check_stationarity: bool = True,
     ) -> None:
         # Initial checks
         if p < 1:
@@ -46,7 +48,7 @@ class VAR:
         elif coeffs is not None:
             # If the parameters are provided, set up using these
             self._ts = None
-            self._parameter_setup(coeffs, mean, sigma_2)
+            self._parameter_setup(coeffs, mean, sigma_2, check_stationarity)
         else:
             raise ValueError("Either the input time series data or the model parameters are required.")
 
@@ -55,6 +57,7 @@ class VAR:
         coeffs: np.ndarray | pd.DataFrame,
         mean: float | int | np.ndarray | pd.DataFrame,
         sigma_2: float | int | np.ndarray | pd.DataFrame,
+        check_stationarity: bool = True,
     ) -> None:
         # Store the coefficients
         if isinstance(coeffs, np.ndarray):
@@ -73,7 +76,7 @@ class VAR:
         self.mu = set_mean(mean, self._d)
         self.sigma_2 = set_cov(sigma_2)
         # Check whether the process is stationary
-        if not self.is_stationary():
+        if check_stationarity and not self.is_stationary():
             warnings.warn("The VAR model is non-stationary based on the provided parameters!", UserWarning)
 
     def fit(self, ts: np.ndarray | pd.DataFrame, demean: bool = True) -> None:
