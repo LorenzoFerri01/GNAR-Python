@@ -108,10 +108,20 @@ class SequentialTestResult:
     selected: str
     alpha: float
     tests: str
+    selected_vs_L_p: float = np.nan     # p-value of the selected model against L (NaN if L is selected)
+
+    @property
+    def adequate(self) -> bool:
+        """False if the selected model is rejected against L at level alpha."""
+        return not (self.selected_vs_L_p <= self.alpha)
 
     def __repr__(self) -> str:
+        note = ""
+        if self.selected != "L":
+            verdict = "rejected" if not self.adequate else "not rejected"
+            note = f" ({verdict} against L, p = {self.selected_vs_L_p:.4g})"
         return (f"Sequential test along AR -> G -> K -> S -> L ({self.tests} tests, alpha = {self.alpha:g})\n"
-                f"{self.table.to_string()}\nSelected model: {self.selected}")
+                f"{self.table.to_string()}\nSelected model: {self.selected}{note}")
 
 
 def _fit_from_stats(name: str, st: _ProfileStatistics, degrees: np.ndarray) -> dict:
@@ -361,48 +371,94 @@ class ModelComparison:
             stats[i] = max(st.n_obs * np.log(rss0 / rss1), 0.0)
         return stats
 
-    def sequential_test(self, alpha: float = 0.05, tests: str = "adjacent", method: str = "auto",
+    def sequential_test(self, alpha: float = 0.05, tests: str = "combined", method: str = "auto",
                         n_boot: int | None = None, seed: int | None = None) -> SequentialTestResult:
         """
-        Bottom-up sequential test along the chain: test AR, then G, then K, then S, each against the next model
-        (tests="adjacent") or against L (tests="vs_L"), and stop at the first model that is not rejected; that model is
-        selected (L if every model is rejected).
+        Bottom-up sequential test along the chain: test AR, then G, then K, then S, and stop at the first model that is not
+        rejected; that model is selected (L if every model is rejected).
+
+        Each step tests the current model M with a level-alpha test, chosen by `tests`:
+
+            "combined" (default) : reject M if the adjacent test (M against the next model) or the omnibus test (M against
+                                   L) rejects at level alpha / 2, i.e. step p-value = min(1, 2 min(p_adjacent, p_vs_L))
+                                   (Bonferroni within the step; for S the two tests coincide). Keeps most of the power of
+                                   the targeted adjacent test while still detecting deviations in other directions.
+            "adjacent"           : M against the next model only. Most powerful against the next extension, but can stop
+                                   early when M is wrong in another direction: e.g. with data from L whose node-specific
+                                   coefficients are unrelated to degree, G -> K has nothing to detect, so the procedure stops
+                                   at G although G -> L rejects strongly.
+            "vs_L"               : M against L only (omnibus): detects any deviation, but a single restriction such as
+                                   kappa = 1 is diluted among about 2N degrees of freedom.
 
         Because the hypotheses are nested (AR true => G true => K true => S true), this is closed testing on a chain: each
-        step is tested at level alpha without adjustment and the family-wise error rate is at most alpha. The adjusted
-        p-value of each step is the running maximum of the raw p-values, and a model is rejected iff its adjusted p-value
-        is <= alpha. All steps are computed and reported; the steps after the first non-rejection are marked as not reached.
+        step only needs to be a valid level-alpha test of its own null, no further adjustment is needed, and the
+        family-wise error rate is at most alpha whichever `tests` is used (choose it before looking at the results). The
+        adjusted p-value of each step is the running maximum of the step p-values, and a model is rejected iff its adjusted
+        p-value is <= alpha. All steps are computed and reported; the steps after the first non-rejection are marked as
+        not reached.
 
-        The choice between adjacent tests (targeted, more powerful against the next extension) and tests against L
-        (omnibus) must be made before looking at the results. Adjacent tests can stop early when a model is wrong in a
-        direction that the next step does not target: e.g. data from L with node-specific coefficients unrelated to degree
-        may not reject G against K, so the procedure stops at G although G -> L would reject. Not rejecting a model does not
-        show that it is correct, and confidence intervals of the selected model do not account for the selection.
+        Adequacy warning: whatever `tests` is, if the selected model is not L and its test against L rejects at level
+        alpha, a UserWarning is raised and the p-value is stored in the result (selected_vs_L_p), since the selected model
+        is then the simplest model not rejected by the procedure but is not supported by the data as a whole. Not rejecting
+        a model does not show that it is correct, and confidence intervals of the selected model do not account for the
+        selection.
 
-        method, n_boot and seed are passed to lr_test for every step (with "auto", each step uses its default reference);
-        when seed is given, step i uses seed + i.
+        method, n_boot and seed are passed to lr_test for every test (with "auto", each test uses its default reference).
+        When seed is given, each distinct test (null, alternative) gets its own seed derived from it. The bootstrap-based
+        p-values carry Monte Carlo noise (with the default 49 draws, a p-value around 0.6 can move by about 0.1 between
+        seeds; values near the usual levels move much less); increase n_boot for more stable p-values.
         """
-        if tests not in ("adjacent", "vs_L"):
-            raise ValueError("tests must be 'adjacent' or 'vs_L'.")
+        if tests not in ("combined", "adjacent", "vs_L"):
+            raise ValueError("tests must be 'combined', 'adjacent' or 'vs_L'.")
         if not 0 < alpha < 1:
             raise ValueError("alpha must be in (0, 1).")
+        cache = {}
+
+        def run(null: str, alt: str) -> LRTestResult:
+            if (null, alt) not in cache:
+                m = method if method != "boundary" or (null, alt) == ("G", "K") else "auto"
+                pair_seed = None if seed is None else seed + 10 * MODELS.index(null) + MODELS.index(alt)
+                cache[(null, alt)] = self.lr_test(null, alt, method=m, n_boot=n_boot, seed=pair_seed)
+            return cache[(null, alt)]
+
         rows = []
         running_max = 0.0
         selected = None
         for i, null in enumerate(MODELS[:-1]):
-            alt = MODELS[i + 1] if tests == "adjacent" else "L"
-            step_method = method
-            if method == "boundary" and (null, alt) != ("G", "K"):
-                step_method = "auto"                     # the boundary reference only applies to G -> K
-            res = self.lr_test(null, alt, method=step_method, n_boot=n_boot, seed=None if seed is None else seed + i)
-            running_max = max(running_max, res.p_value)
+            nxt = MODELS[i + 1]
+            row = {}
+            if tests == "adjacent":
+                res = run(null, nxt)
+                row.update(test=f"{null} -> {nxt}", statistic=res.statistic, df=res.df, reference=res.method,
+                           p_value=res.p_value)
+            elif tests == "vs_L":
+                res = run(null, "L")
+                row.update(test=f"{null} -> L", statistic=res.statistic, df=res.df, reference=res.method,
+                           p_value=res.p_value)
+            else:
+                adj, omni = run(null, nxt), run(null, "L")
+                step_p = adj.p_value if nxt == "L" else min(1.0, 2 * min(adj.p_value, omni.p_value))
+                row.update(test=null if nxt == "L" else f"{null} -> {nxt} | {null} -> L", p_adjacent=adj.p_value,
+                           p_vs_L=omni.p_value, p_value=step_p)
+            running_max = max(running_max, row["p_value"])
             reject = running_max <= alpha
             reached = selected is None
             if reached and not reject:
                 selected = null
-            rows.append({"test": f"{null} -> {alt}", "statistic": res.statistic, "df": res.df, "reference": res.method,
-                         "p_value": res.p_value, "adjusted_p": running_max, "reject": reject, "reached": reached})
-        return SequentialTestResult(pd.DataFrame(rows).set_index("test"), selected or "L", alpha, tests)
+            row.update(adjusted_p=running_max, reject=reject, reached=reached)
+            rows.append(row)
+        if tests == "combined":
+            rows[-1]["test"] = "S -> L"
+        selected = selected or "L"
+
+        selected_vs_L_p = np.nan
+        if selected != "L":
+            selected_vs_L_p = run(selected, "L").p_value
+            if selected_vs_L_p <= alpha:
+                warnings.warn(f"The selected model {selected} is rejected against the local model L "
+                              f"(p = {selected_vs_L_p:.3g}): it is the simplest model not rejected by the sequential "
+                              f"procedure, but it does not fit the data as well as L.", UserWarning)
+        return SequentialTestResult(pd.DataFrame(rows).set_index("test"), selected, alpha, tests, selected_vs_L_p)
 
     def __repr__(self) -> str:
         return f"ModelComparison(N={self._N}, T={self._T}, models={MODELS}, demean={self._demean})"

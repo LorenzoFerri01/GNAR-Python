@@ -239,46 +239,65 @@ class TestSize:
 
 class TestSequential:
 
-    def test_selects_k(self):
+    def _data_from_l(self):
+        # Node-specific coefficients unrelated to degree: G is wrong, but not in the direction G -> K targets
+        rng = np.random.default_rng(7)
+        N = A_150.shape[0]
+        alphas, betas = rng.uniform(-0.3, 0.6, N), rng.uniform(0.0, 0.35, N)
+        return _cmp(A_150, _simulate_nodewise(A_150, alphas, betas, 300, rng))
+
+    def test_combined_is_default_and_selects_k(self):
         c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.6, 0.3, 200, np.random.default_rng(5)))
-        res = c.sequential_test()
-        assert res.selected == "K"
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")                 # K is adequate: no warning
+            res = c.sequential_test(seed=0)
+        assert res.tests == "combined" and res.selected == "K" and res.adequate
         t = res.table
-        assert list(t.index) == ["AR -> G", "G -> K", "K -> S", "S -> L"]
+        assert list(t.index) == ["AR -> G | AR -> L", "G -> K | G -> L", "K -> S | K -> L", "S -> L"]
         assert list(t["reached"]) == [True, True, True, False]
+        expected = np.minimum(1, 2 * np.minimum(t["p_adjacent"], t["p_vs_L"]))
+        expected.iloc[-1] = t["p_adjacent"].iloc[-1]       # for S the adjacent test is the test against L
+        np.testing.assert_allclose(t["p_value"], expected)
         np.testing.assert_allclose(t["adjusted_p"], np.maximum.accumulate(t["p_value"]))
         assert list(t["reject"]) == list(t["adjusted_p"] <= 0.05)
+        assert res.selected_vs_L_p == pytest.approx(t.loc["K -> S | K -> L", "p_vs_L"])
+
+    def test_adjacent_mode(self):
+        c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.6, 0.3, 200, np.random.default_rng(5)))
+        res = c.sequential_test(tests="adjacent", seed=0)
+        assert list(res.table.index) == ["AR -> G", "G -> K", "K -> S", "S -> L"]
+        assert res.selected == "K"
 
     def test_selects_ar_without_network(self):
         c = _cmp(A_150, _simulate_nodewise(A_150, 0.4, 0.0, 100, np.random.default_rng(6)))
-        res = c.sequential_test()
+        res = c.sequential_test(seed=0)
         assert res.selected == "AR"
         assert list(res.table["reached"]) == [True, False, False, False]
 
-    def test_selects_l_when_everything_rejected(self):
-        rng = np.random.default_rng(7)
-        N = A_150.shape[0]
-        alphas, betas = rng.uniform(-0.3, 0.6, N), rng.uniform(0.0, 0.35, N)
-        c = _cmp(A_150, _simulate_nodewise(A_150, alphas, betas, 300, rng))
-        assert c.sequential_test(tests="vs_L", seed=0).selected == "L"
+    @pytest.mark.parametrize("tests", ["combined", "vs_L"])
+    def test_selects_l_when_g_is_wrong_in_another_direction(self, tests):
+        res = self._data_from_l().sequential_test(tests=tests, seed=0)
+        assert res.selected == "L" and np.isnan(res.selected_vs_L_p) and res.adequate
 
-    def test_adjacent_can_stop_early(self):
-        # Documented power caveat: with node-specific coefficients unrelated to degree, G is wrong but the adjacent
-        # G -> K test has nothing to detect, so the adjacent procedure may stop at G while G -> L clearly rejects
-        rng = np.random.default_rng(7)
-        N = A_150.shape[0]
-        alphas, betas = rng.uniform(-0.3, 0.6, N), rng.uniform(0.0, 0.35, N)
-        c = _cmp(A_150, _simulate_nodewise(A_150, alphas, betas, 300, rng))
-        adjacent = c.sequential_test(seed=0)
-        assert adjacent.selected == "G"
-        assert c.lr_test("G", "L", seed=0).p_value < 1e-6
+    def test_adjacent_stops_early_and_warns(self):
+        # Documented power caveat of adjacent tests: the procedure stops at G although G -> L rejects strongly; the
+        # adequacy warning makes this visible
+        c = self._data_from_l()
+        with pytest.warns(UserWarning, match="selected model G is rejected against the local model L"):
+            res = c.sequential_test(tests="adjacent", seed=0)
+        assert res.selected == "G" and not res.adequate and res.selected_vs_L_p < 1e-6
+        assert "rejected against L" in repr(res)
 
     def test_vs_l(self):
         c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.6, 0.3, 200, np.random.default_rng(5)))
-        res = c.sequential_test(tests="vs_L")
+        res = c.sequential_test(tests="vs_L", seed=0)
         assert list(res.table.index) == ["AR -> L", "G -> L", "K -> L", "S -> L"]
         assert res.selected == "K"
-        assert "Selected model: K" in repr(res)
+        assert "Selected model: K (not rejected against L" in repr(res)
+
+    def test_reproducible_with_seed(self):
+        c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.6, 0.3, 60, np.random.default_rng(5)))
+        pd.testing.assert_frame_equal(c.sequential_test(seed=3).table, c.sequential_test(seed=3).table)
 
     def test_invalid_arguments(self):
         c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.6, 0.3, 30, np.random.default_rng(5)))
