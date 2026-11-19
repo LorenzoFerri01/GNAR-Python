@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from gnar import GNAR, KappaGNAR, ModelComparison
+from gnar import GNAR, KappaGNAR, ModelComparison, NodewiseModel
 from gnar.comparison import MODELS
 from gnar.utils.graphs import powerlaw_configuration_graph
 
@@ -23,17 +23,7 @@ DEG_150 = np.asarray(A_150.sum(axis=1)).ravel()
 
 def _simulate_nodewise(A, alpha, beta, T, rng, sigma_2=1.0, burn_in=50):
     """Simulate X_t = diag(alpha) X_{t-1} + diag(beta / d) A X_{t-1} + e_t (beta on the neighbour average)."""
-    d = np.asarray(A.sum(axis=1)).ravel()
-    N = d.size
-    phi = (sp.diags_array(np.broadcast_to(alpha, N).astype(float))
-           + sp.diags_array(np.broadcast_to(beta, N) / d) @ A).tocsr()
-    x = np.zeros(N)
-    out = np.empty((T, N))
-    for t in range(burn_in + T):
-        x = phi @ x + rng.standard_normal(N) * np.sqrt(sigma_2)
-        if t >= burn_in:
-            out[t - burn_in] = x
-    return out
+    return NodewiseModel(A, alpha, beta, sigma_2=sigma_2).simulate(T, burn_in=burn_in, rng=rng)
 
 
 def _simulate_kappa(A, alpha, b, kappa, T, rng):
@@ -209,9 +199,16 @@ class TestSize:
 
     def _rate(self, simulate, null, alt, method="auto", T=30):
         rejections = 0
+        non_stationary = 0
         for seed in range(self.REPS):
             c = _cmp(A_150, simulate(T, np.random.default_rng(1000 + seed)))
-            rejections += c.lr_test(null, alt, method=method).p_value <= 0.05
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                rejections += c.lr_test(null, alt, method=method).p_value <= 0.05
+            non_stationary += any("non-stationary" in str(w.message) for w in caught)
+        # With very short series a fitted null with node-specific coefficients can occasionally be non-stationary;
+        # the bootstrap then warns. This must stay rare.
+        assert non_stationary <= 0.02 * self.REPS
         return rejections / self.REPS
 
     def test_ar_to_g(self):
@@ -238,6 +235,13 @@ class TestSize:
 
 
 class TestSequential:
+
+    @staticmethod
+    def _quiet_sequential(c, **kwargs):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res = c.sequential_test(**kwargs)
+        return res, [str(w.message) for w in caught]
 
     def _data_from_l(self):
         # Node-specific coefficients unrelated to degree: G is wrong, but not in the direction G -> K targets
@@ -276,15 +280,16 @@ class TestSequential:
 
     @pytest.mark.parametrize("tests", ["combined", "vs_L"])
     def test_selects_l_when_g_is_wrong_in_another_direction(self, tests):
-        res = self._data_from_l().sequential_test(tests=tests, seed=0)
+        res, messages = self._quiet_sequential(self._data_from_l(), tests=tests, seed=0)
         assert res.selected == "L" and np.isnan(res.selected_vs_L_p) and res.adequate
+        assert not any("non-stationary" in m for m in messages)
 
     def test_adjacent_stops_early_and_warns(self):
         # Documented power caveat of adjacent tests: the procedure stops at G although G -> L rejects strongly; the
         # adequacy warning makes this visible
         c = self._data_from_l()
-        with pytest.warns(UserWarning, match="selected model G is rejected against the local model L"):
-            res = c.sequential_test(tests="adjacent", seed=0)
+        res, messages = self._quiet_sequential(c, tests="adjacent", seed=0)
+        assert any("selected model G is rejected against the local model L" in m for m in messages)
         assert res.selected == "G" and not res.adequate and res.selected_vs_L_p < 1e-6
         assert "rejected against L" in repr(res)
 
@@ -344,3 +349,80 @@ class TestValidationAndScale:
         c.table()
         assert time.perf_counter() - t0 < 15
         assert res.selected == "K"
+
+
+class TestNodewiseModel:
+
+    def _random_coefficients(self, N, rng, signs="mixed"):
+        alpha = rng.uniform(-0.5, 0.6, N)
+        beta = rng.uniform(-0.8, 0.8, N) if signs == "mixed" else rng.uniform(0.1, 0.8, N) * (1 if signs == "pos" else -1)
+        return alpha, beta
+
+    @pytest.mark.parametrize("signs", ["mixed", "pos", "neg"])
+    @pytest.mark.parametrize("N", [60, 300])          # dense path (<= 200 nodes) and sparse eigensolver path
+    def test_spectral_radius_matches_dense(self, signs, N):
+        A = _graph(N, seed=3)
+        rng = np.random.default_rng(N)
+        alpha, beta = self._random_coefficients(A.shape[0], rng, signs)
+        m = NodewiseModel(A, alpha, beta)
+        dense = np.max(np.abs(np.linalg.eigvals(m.phi().toarray())))
+        assert m.phi_spectral_radius() == pytest.approx(dense, rel=1e-7)
+
+    def test_spectral_radius_with_zero_betas(self):
+        A = _graph(300, seed=3)
+        rng = np.random.default_rng(0)
+        alpha, beta = self._random_coefficients(A.shape[0], rng, "pos")
+        beta[::7] = 0.0                                  # zeros break the symmetric route; the general solver is used
+        m = NodewiseModel(A, alpha, beta)
+        assert m.phi_spectral_radius() == pytest.approx(np.max(np.abs(np.linalg.eigvals(m.phi().toarray()))), rel=1e-7)
+
+    @pytest.mark.parametrize("signs", ["mixed", "pos"])
+    def test_row_budget_guarantees_stationarity(self, signs):
+        A = _graph(300, seed=4)
+        rng = np.random.default_rng(1)
+        for _ in range(5):
+            alpha = rng.uniform(-0.5, 0.5, A.shape[0])
+            beta_shape = rng.uniform(-1.5, 1.5, A.shape[0]) if signs == "mixed" else rng.uniform(0.5, 1.5, A.shape[0])
+            m = NodewiseModel(A, alpha, beta_shape, row_budget=0.95)
+            assert m.row_sums().max() == pytest.approx(0.95)
+            assert m.beta_scale < 1
+            np.testing.assert_allclose(m.beta, m.beta_scale * beta_shape)       # one global factor: shape preserved
+            assert m.phi_spectral_radius() <= 0.95 + 1e-9 and m.is_stationary()
+
+    def test_row_budget_leaves_admissible_coefficients_unchanged(self):
+        m = NodewiseModel(A_150, 0.3, np.full(A_150.shape[0], 0.5), row_budget=0.95)
+        assert m.beta_scale == 1.0 and np.all(m.beta == 0.5)
+
+    def test_row_budget_validation(self):
+        with pytest.raises(ValueError, match="row_budget"):
+            NodewiseModel(A_150, 0.3, 0.5, row_budget=1.2)
+        with pytest.raises(ValueError, match="alpha"):
+            NodewiseModel(A_150, 0.96, 0.1, row_budget=0.95)
+
+    def test_without_budget_can_be_non_stationary(self):
+        m = NodewiseModel(A_150, 0.6, 0.6)
+        assert not m.is_stationary() and m.phi_spectral_radius() == pytest.approx(1.2)
+
+    def test_simulate(self):
+        m = NodewiseModel(A_150, 0.3, 0.4, mean=2.0, sigma_2=0.5)
+        a = m.simulate(20, rng=5)
+        b = m.simulate(20, rng=np.random.default_rng(5))
+        np.testing.assert_array_equal(a, b)
+        assert a.shape == (20, A_150.shape[0])
+        x = m.simulate(5000, rng=1)
+        assert x.mean() == pytest.approx(2.0, abs=0.02)
+
+    def test_fitted_models_are_nodewise_models(self):
+        c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.5, 0.5, 40, np.random.default_rng(0)))
+        for name in ("AR", "S", "L"):
+            assert isinstance(c[name], NodewiseModel)
+            assert c[name].is_stationary()
+        assert "NodewiseFit(model=L" in repr(c["L"])
+
+    def test_bootstrap_warns_for_non_stationary_null(self):
+        c = _cmp(A_150, _simulate_kappa(A_150, 0.3, 0.5, 0.5, 40, np.random.default_rng(0)))
+        c._fits["S"]["beta"] = c._fits["S"]["beta"] + 1.0            # force a non-stationary fitted null
+        c._models.pop("S", None)
+        c.__dict__.pop("_rho_cache", None)
+        with pytest.warns(UserWarning, match="fitted null model S is non-stationary"):
+            c._bootstrap_lr("S", "L", 2, seed=0)

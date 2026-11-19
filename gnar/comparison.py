@@ -36,14 +36,17 @@ Asymptotically unbiased inference for a dynamic panel model with fixed effects w
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from scipy.sparse.linalg import eigs, eigsh
 from scipy.stats import chi2, f as f_dist
 
-from gnar.kappa import KappaGNAR, _ProfileStatistics, _PROFILE_GRID_SIZE, _as_csr, _degrees, check_kappa_adjacency
+from gnar.kappa import (KappaGNAR, _DENSE_EIG_MAX_NODES, _ProfileStatistics, _PROFILE_GRID_SIZE, _as_csr, _degrees,
+                        kappa_spectrum_bounds,
+                        check_kappa_adjacency)
 
 MODELS = ("AR", "G", "K", "S", "L")
 DESCRIPTIONS = {
@@ -55,25 +58,126 @@ DESCRIPTIONS = {
 }
 
 
-@dataclass
-class NodewiseFit:
+class NodewiseModel:
     """
-    A fitted AR, S or L model. alpha and beta are per-node arrays (constant for global coefficients); beta is the
-    coefficient on the neighbour *average* d_i^{-1} sum_j X_{j,t-1}, as in GNAR.
+    Network autoregression with node-specific coefficients on an unweighted, undirected graph without isolated nodes:
+
+        X_t - mu = Phi (X_{t-1} - mu) + e_t,    Phi = diag(alpha) + diag(beta / d) A,    e_t ~ N(0, sigma_2 I),
+
+    i.e. X_{i,t} - mu_i = alpha_i (X_{i,t-1} - mu_i) + beta_i * (average of the neighbours' X_{j,t-1} - mu_j) + e_{i,t}.
+    Covers the models AR (beta = 0), G (constant alpha and beta), S (constant alpha) and L of the comparison chain;
+    alpha and beta may have any signs.
+
+    Stationarity. The rows of D^{-1} A sum to 1, so row i of Phi has absolute sum |alpha_i| + |beta_i| and, for any signs,
+    rho(Phi) <= ||Phi||_inf = max_i (|alpha_i| + |beta_i|). With row_budget = r < 1, beta is rescaled by a single global
+    factor (only if needed, so that its shape across nodes is preserved) such that max_i (|alpha_i| + |beta_i|) <= r,
+    which guarantees stationarity. phi_spectral_radius() computes the exact spectral radius.
+
+    Parameters:
+        A (np.ndarray or scipy sparse matrix): Binary, symmetric adjacency matrix without self-loops or isolated nodes.
+        alpha (float or array of length N): Autoregressive coefficients.
+        beta (float or array of length N): Coefficients on the neighbour average.
+        mean (float or array of length N): Mean of the process. Defaults to 0.
+        sigma_2 (float): Noise variance. Defaults to 1.
+        row_budget (float or None): If given (in (0, 1)), rescale beta so that every |alpha_i| + |beta_i| <= row_budget.
+            Requires max_i |alpha_i| < row_budget. The factor applied is stored in beta_scale (1 if no rescaling was
+            needed). Defaults to None (no rescaling).
     """
-    name: str
-    alpha: np.ndarray
-    beta: np.ndarray
-    sigma_2: float
-    loglik: float
-    n_coef: int
-    mu: np.ndarray
-    _A: sp.csr_array = field(repr=False)
-    _degrees: np.ndarray = field(repr=False)
+
+    def __init__(self, A, alpha, beta, mean=0.0, sigma_2: float = 1.0, row_budget: float | None = None) -> None:
+        check_kappa_adjacency(A)
+        self._A = _as_csr(A)
+        self._degrees = _degrees(self._A)
+        N = self._A.shape[0]
+        self.alpha = np.broadcast_to(np.asarray(alpha, dtype=float), (N,)).copy()
+        beta = np.broadcast_to(np.asarray(beta, dtype=float), (N,)).copy()
+        self.beta_scale = 1.0
+        if row_budget is not None:
+            if not 0 < row_budget < 1:
+                raise ValueError("row_budget must be in (0, 1).")
+            room = row_budget - np.abs(self.alpha)
+            if np.any(room <= 0):
+                raise ValueError("max |alpha_i| must be smaller than row_budget.")
+            nonzero = beta != 0
+            if np.any(nonzero):
+                self.beta_scale = float(min(1.0, np.min(room[nonzero] / np.abs(beta[nonzero]))))
+            beta = beta * self.beta_scale
+        self.beta = beta
+        mean = np.asarray(mean, dtype=float)
+        if mean.size not in (1, N):
+            raise ValueError(f"mean must be a scalar or have N = {N} entries.")
+        self.mu = np.broadcast_to(mean.ravel(), (N,)).reshape(1, N).copy()
+        if np.ndim(sigma_2) != 0 or not sigma_2 > 0:
+            raise ValueError("sigma_2 must be a positive scalar.")
+        self.sigma_2 = float(sigma_2)
 
     def phi(self) -> sp.csr_array:
         """Sparse VAR(1) coefficient matrix diag(alpha) + diag(beta / d) A."""
         return (sp.diags_array(self.alpha) + sp.diags_array(self.beta / self._degrees) @ self._A).tocsr()
+
+    def row_sums(self) -> np.ndarray:
+        """Absolute row sums |alpha_i| + |beta_i| of Phi; their maximum bounds the spectral radius."""
+        return np.abs(self.alpha) + np.abs(self.beta)
+
+    def phi_spectral_radius(self) -> float:
+        """
+        Exact spectral radius of Phi, for any signs of alpha and beta. If all beta_i / d_i are non-zero with the same
+        sign s, Phi = diag(alpha) + s C A with C = |diag(beta / d)| is similar to the symmetric matrix
+        diag(alpha) + s C^{1/2} A C^{1/2}, whose two extreme eigenvalues are computed with sparse Lanczos iterations;
+        otherwise a sparse general eigensolver (ARPACK) finds the eigenvalue of largest modulus. Graphs with at most 200
+        nodes use dense solvers.
+        """
+        N = self.alpha.size
+        if N <= _DENSE_EIG_MAX_NODES:
+            return float(np.max(np.abs(np.linalg.eigvals(self.phi().toarray()))))
+        c = self.beta / self._degrees
+        if np.all(c > 0) or np.all(c < 0):
+            s = np.sqrt(np.abs(c))
+            sym = (sp.diags_array(self.alpha) + np.sign(c[0]) * (sp.diags_array(s) @ self._A @ sp.diags_array(s))).tocsr()
+            hi = eigsh(sym, k=1, which="LA", v0=np.ones(N), return_eigenvectors=False)[0]
+            lo = eigsh(sym, k=1, which="SA", v0=np.random.default_rng(0).standard_normal(N), return_eigenvectors=False)[0]
+            return float(max(abs(lo), abs(hi)))
+        val = eigs(self.phi(), k=1, which="LM", v0=np.random.default_rng(0).standard_normal(N), return_eigenvectors=False)
+        return float(np.abs(val[0]))
+
+    def is_stationary(self) -> bool:
+        """Whether the spectral radius of Phi is smaller than 1 (checked with the cheap row-sum bound first)."""
+        return bool(self.row_sums().max() < 1 or self.phi_spectral_radius() < 1)
+
+    def simulate(self, n: int, burn_in: int = 50, rng: np.random.Generator | int | None = None) -> np.ndarray:
+        """
+        Simulate n time steps (after burn_in steps started from zero). Each step costs one sparse matrix-vector product.
+        Uses its own random generator (rng: a numpy Generator or a seed), so np.random is not affected.
+
+        Returns:
+            np.ndarray: Shape (n, N).
+        """
+        rng = np.random.default_rng(rng)
+        phi = self.phi()
+        N = self.alpha.size
+        sd = np.sqrt(self.sigma_2)
+        x, out = np.zeros(N), np.empty((n, N))
+        for t in range(burn_in + n):
+            x = phi @ x + rng.standard_normal(N) * sd
+            if t >= burn_in:
+                out[t - burn_in] = x
+        return out + self.mu
+
+
+class NodewiseFit(NodewiseModel):
+    """
+    A fitted AR, S or L model (see NodewiseModel). alpha and beta are per-node arrays (constant for global coefficients);
+    beta is the coefficient on the neighbour *average* d_i^{-1} sum_j X_{j,t-1}, as in GNAR.
+    """
+
+    def __init__(self, name: str, A, alpha, beta, mu, sigma_2: float, loglik: float, n_coef: int) -> None:
+        super().__init__(A, alpha, beta, mean=mu, sigma_2=sigma_2)
+        self.name = name
+        self.loglik = loglik
+        self.n_coef = n_coef
+
+    def __repr__(self) -> str:
+        return f"NodewiseFit(model={self.name}, N={self.alpha.size}, n_coef={self.n_coef}, loglik={self.loglik:.6g})"
 
 
 @dataclass
@@ -227,9 +331,8 @@ class ModelComparison:
                 self._models[name] = KappaGNAR(self._A, ts=self._ts, kappa=1.0 if name == "G" else None,
                                                demean=self._demean)
             else:
-                self._models[name] = NodewiseFit(name, fit["alpha"], fit["beta"], fit["rss"] / self.n_obs,
-                                                 self._loglik(fit["rss"]), fit["n_coef"], self._mu, self._A,
-                                                 self._degrees)
+                self._models[name] = NodewiseFit(name, self._A, fit["alpha"], fit["beta"], self._mu,
+                                                 fit["rss"] / self.n_obs, self._loglik(fit["rss"]), fit["n_coef"])
         return self._models[name]
 
     def table(self) -> pd.DataFrame:
@@ -350,6 +453,11 @@ class ModelComparison:
         """Bootstrap distribution of the LR statistic under the fitted null model."""
         rng = np.random.default_rng(seed)
         fit0 = self._fits[null]
+        rho = self._null_spectral_radius(null)
+        if rho >= 1:
+            warnings.warn(f"The fitted null model {null} is non-stationary (spectral radius {rho:.4f} >= 1): data "
+                          f"simulated from it are not representative and the bootstrap-based p-value is unreliable.",
+                          UserWarning)
         phi = (sp.diags_array(fit0["alpha"]) + sp.diags_array(fit0["beta"] / self._degrees) @ self._A).tocsr()
         sd = np.sqrt(fit0["rss"] / self.n_obs)
         start = self._Y[0]
@@ -370,6 +478,22 @@ class ModelComparison:
                 rss1 = _fit_from_stats(alternative, st, self._degrees)["rss"]
             stats[i] = max(st.n_obs * np.log(rss0 / rss1), 0.0)
         return stats
+
+    def _null_spectral_radius(self, name: str) -> float:
+        """Spectral radius of the fitted model (cached): closed form for AR, G and K, exact eigenvalues for S."""
+        cache = self.__dict__.setdefault("_rho_cache", {})
+        if name not in cache:
+            fit = self._fits[name]
+            if name == "AR":
+                cache[name] = abs(float(fit["alpha"][0]))
+            elif name in ("G", "K"):
+                # Phi = alpha I + beta D^{-kappa} A, whose eigenvalues are alpha + beta mu, mu in [mu_min, rho_kappa]
+                mu_min, rho_k = kappa_spectrum_bounds(self._A, fit["kappa"])
+                a, bt = float(fit["alpha"][0]), fit["beta_global"]
+                cache[name] = max(abs(a + bt * rho_k), abs(a + bt * mu_min))
+            else:
+                cache[name] = self[name].phi_spectral_radius()
+        return cache[name]
 
     def sequential_test(self, alpha: float = 0.05, tests: str = "combined", method: str = "auto",
                         n_boot: int | None = None, seed: int | None = None) -> SequentialTestResult:
