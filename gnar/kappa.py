@@ -130,12 +130,14 @@ class _ProfileStatistics:
     def __init__(self, Y: np.ndarray, A: sp.csr_array, log_deg: np.ndarray) -> None:
         y_lag, y_cur = Y[:-1], Y[1:]
         S = np.asarray(A @ y_lag.T).T                      # (T - 1, N) raw neighbour sums
-        self.sxx = float(np.einsum("ij,ij->", y_lag, y_lag))
-        self.sxy = float(np.einsum("ij,ij->", y_lag, y_cur))
-        self.syy = float(np.einsum("ij,ij->", y_cur, y_cur))
+        # Per-node sums (also used by gnar.comparison for models with node-specific coefficients)
+        self.x = np.einsum("ij,ij->j", y_lag, y_lag)       # sum_t y_{i,t-1}^2
+        self.c = np.einsum("ij,ij->j", y_lag, y_cur)       # sum_t y_{i,t-1} y_{i,t}
+        self.s = np.einsum("ij,ij->j", y_cur, y_cur)       # sum_t y_{i,t}^2
         self.q = np.einsum("ij,ij->j", S, S)
         self.r = np.einsum("ij,ij->j", y_lag, S)
         self.u = np.einsum("ij,ij->j", y_cur, S)
+        self.sxx, self.sxy, self.syy = float(self.x.sum()), float(self.c.sum()), float(self.s.sum())
         self.log_deg = log_deg
         self.n_obs = y_cur.size                            # (T - 1) N
         if self.sxx == 0:
@@ -392,8 +394,15 @@ class KappaGNAR:
     def kappa_confint(self, level: float = 0.95) -> tuple[float, float]:
         """
         Profile-likelihood confidence interval for kappa: {kappa in [0, 1] : 2 [l(kappa_hat) - l(kappa)] <= chi2_1(level)},
-        truncated to [0, 1]. The chi2_1 cut-off is exact asymptotically for interior kappa and conservative when the true
-        kappa is 0 or 1 (where the likelihood-ratio statistic is a 1/2 chi2_0 + 1/2 chi2_1 mixture).
+        truncated to [0, 1].
+
+        Boundary behaviour (deliberate choice). The chi2_1 cut-off (3.84 at 95%) is asymptotically exact for interior
+        values of kappa, but at the endpoints kappa = 0 and kappa = 1 the likelihood-ratio statistic follows the mixture
+        1/2 chi2_0 + 1/2 chi2_1, whose 95% quantile is 2.71. The interval therefore remains valid but is conservative at
+        the boundary: if the true kappa is 1 (or 0), the 95% interval contains it about 97.5% of the time. A consequence is
+        that the interval can disagree with the boundary test of kappa = 1 (gnar.comparison.ModelComparison.lr_test("G",
+        "K"), which uses the mixture): when 2.71 < 2 [l(kappa_hat) - l(1)] <= 3.84, the test rejects kappa = 1 at 5% while
+        the 95% interval still contains 1. Near (but not at) the boundary, both chi2 approximations are only rough.
         """
         fit = self._require_fit()
         if not fit["kappa_estimated"]:
@@ -446,9 +455,15 @@ class KappaGNAR:
 
         Standard errors come from the asymptotic covariance sigma_2 (J^T J)^{-1} of the least-squares estimates of
         (alpha, beta, kappa), with the delta method for b = beta * rho_kappa; intervals for alpha, b and beta are Wald
-        intervals. The interval for kappa is the profile-likelihood interval (see kappa_confint). When kappa is fixed, or
-        estimated on the boundary of [0, 1], its standard error is NaN and the other standard errors are conditional on
-        kappa; near the boundary they understate the uncertainty.
+        intervals. The interval for kappa is the profile-likelihood interval (see kappa_confint): it is conservative at
+        the boundary of [0, 1] and can contain kappa = 1 even when the boundary test of kappa = 1 rejects (when the
+        likelihood-ratio statistic lies between 2.71 and 3.84 at the 95% level). When kappa is fixed, or estimated on the
+        boundary of [0, 1], its standard error is NaN and the other standard errors are conditional on kappa; near the
+        boundary they understate the uncertainty.
+
+        Per-node demeaning (demean=True) biases alpha downwards by roughly (1 + 3 alpha) / T. The standard errors shrink
+        like 1 / sqrt(N T) but this bias only like 1 / T, so with many nodes and short series the interval for alpha can
+        miss the true value.
         """
         fit = self._require_fit()
         cov, params = self._covariance()
